@@ -31,6 +31,22 @@ export function plcToSparkplugType(plcDatatype: string): string {
   }
 }
 
+/** Full metadata options for creating a metric with all available properties */
+export type MetricMetadata = {
+  /** PLC datatype (number, boolean, string, udt) */
+  datatype: string;
+  /** Source of the value (plc, mqtt, graphql, field, manual) */
+  source?: string;
+  /** Data quality (good, uncertain, bad) */
+  quality?: string;
+  /** RBE deadband configuration */
+  deadband?: { value: number; maxTime?: number };
+  /** Whether RBE checking is disabled */
+  disableRBE?: boolean;
+  /** Optional polling interval (ms) */
+  scanRate?: number;
+};
+
 /**
  * Create a Synapse Sparkplug B metric from a PLC variable
  *
@@ -45,6 +61,8 @@ export function plcToSparkplugType(plcDatatype: string): string {
  * @param scanRate - Optional polling interval (ms). If set, metric is polled; if not, published on change
  * @param deadband - Optional RBE deadband configuration from NATS
  * @param disableRBE - Optional flag to disable RBE checking for debugging
+ * @param source - Optional source identifier (plc, mqtt, graphql, field, manual)
+ * @param quality - Optional data quality (good, uncertain, bad)
  * @returns Synapse SparkplugMetric ready for MQTT publishing
  */
 export function createMetric(
@@ -55,6 +73,8 @@ export function createMetric(
   scanRate?: number,
   deadband?: { value: number; maxTime?: number },
   disableRBE?: boolean,
+  source?: string,
+  quality?: string,
 ): SparkplugMetric {
   const sparkplugType = plcToSparkplugType(plcDatatype);
   let convertedValue: number | boolean | string | null = null;
@@ -106,13 +126,39 @@ export function createMetric(
     metric.disableRBE = disableRBE;
   }
 
-  // Store original PLC datatype as metadata property
+  // Store metadata as Sparkplug B metric properties
   metric.properties = {
     datatype: {
       value: plcDatatype,
       type: "String",
     },
   };
+
+  // Add optional metadata properties if provided
+  if (source) {
+    metric.properties.source = {
+      value: source,
+      type: "String",
+    };
+  }
+  if (quality) {
+    metric.properties.quality = {
+      value: quality,
+      type: "String",
+    };
+  }
+  if (deadband) {
+    metric.properties.deadbandValue = {
+      value: deadband.value,
+      type: "Double",
+    };
+    if (deadband.maxTime !== undefined) {
+      metric.properties.deadbandMaxTime = {
+        value: deadband.maxTime,
+        type: "Int32",
+      };
+    }
+  }
 
   return metric;
 }

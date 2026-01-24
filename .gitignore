@@ -1,0 +1,13 @@
+# Deno
+.deno/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Local config
+.env
+.env.local
