@@ -5,10 +5,10 @@
   "imports": {
     "@joyautomation/coral": "jsr:@joyautomation/coral@^0.0.12",
     "@joyautomation/dark-matter": "jsr:@joyautomation/dark-matter@^0.0.27",
-    "@joyautomation/synapse": "file:///home/joyja/Development/deno/synapse/index.ts",
+    "@joyautomation/synapse": "jsr:@joyautomation/synapse@^0.0.85",
     "@nats-io/transport-deno": "jsr:@nats-io/transport-deno@3.3",
     "@nats-io/jetstream": "jsr:@nats-io/jetstream@3.3",
-    "@tentacle/nats-schema": "file:///home/joyja/Development/nats-schema/src/mod.ts",
+    "@joyautomation/nats-schema": "https://raw.githubusercontent.com/joyautomation/nats-schema/main/src/mod.ts",
     "long": "npm:long@^5.3.2",
     "mqtt": "npm:mqtt@^5.14.1",
     "pako": "npm:pako@^2.1.0",
