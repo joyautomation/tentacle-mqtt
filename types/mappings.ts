@@ -123,7 +123,7 @@ export function createMetric(
     metric.deadband = deadband;
   }
   if (disableRBE) {
-    metric.disableRBE = disableRBE;
+    (metric as any).disableRBE = disableRBE;
   }
 
   // Store metadata as Sparkplug B metric properties

@@ -2,7 +2,10 @@
   "version": "5",
   "specifiers": {
     "jsr:@joyautomation/coral@^0.0.12": "0.0.12",
+    "jsr:@joyautomation/dark-matter@^0.0.26": "0.0.26",
     "jsr:@joyautomation/dark-matter@^0.0.27": "0.0.27",
+    "jsr:@joyautomation/nats-schema@^0.0.1": "0.0.1",
+    "jsr:@joyautomation/synapse@^0.0.85": "0.0.85",
     "jsr:@nats-io/jetstream@3.3": "3.3.0",
     "jsr:@nats-io/nats-core@3.3.0": "3.3.0",
     "jsr:@nats-io/nkeys@2.0.3": "2.0.3",
@@ -11,7 +14,9 @@
     "jsr:@std/bytes@^1.0.5": "1.0.6",
     "jsr:@std/fmt@^1.0.2": "1.0.8",
     "jsr:@std/io@0.225.2": "0.225.2",
+    "npm:long@^5.2.3": "5.3.2",
     "npm:long@^5.3.2": "5.3.2",
+    "npm:mqtt@^5.10.1": "5.14.1",
     "npm:mqtt@^5.14.1": "5.14.1",
     "npm:pako@^2.1.0": "2.1.0",
     "npm:sparkplug-payload@1.0.3": "1.0.3",
@@ -25,8 +30,25 @@
         "jsr:@std/fmt"
       ]
     },
+    "@joyautomation/dark-matter@0.0.26": {
+      "integrity": "7276ddefea2448937b72ada91b3adb86efe4f01032c1dd7915900b59201cba2e"
+    },
     "@joyautomation/dark-matter@0.0.27": {
       "integrity": "8eabf924bbaeb2857f3a6de0799fb980f40569f3f3ce6c0d39fec237d6b2ccaa"
+    },
+    "@joyautomation/nats-schema@0.0.1": {
+      "integrity": "eff772799ee7b8a04e6cd38b944a1d570035af925d5681f430bca58147e7d28d"
+    },
+    "@joyautomation/synapse@0.0.85": {
+      "integrity": "ec54b5d32006daf1fb538b1f0bdb3d8394282eb60e26142267083930e55d5d60",
+      "dependencies": [
+        "jsr:@joyautomation/coral",
+        "jsr:@joyautomation/dark-matter@^0.0.26",
+        "npm:long@^5.2.3",
+        "npm:mqtt@^5.10.1",
+        "npm:pako",
+        "npm:sparkplug-payload@1.0.3"
+      ]
     },
     "@nats-io/jetstream@3.3.0": {
       "integrity": "131ca1ee63dc41fb4a79b8e27d0b2367dc4b3974aac8047b83757f38db85f3b4",
@@ -402,6 +424,8 @@
     "dependencies": [
       "jsr:@joyautomation/coral@^0.0.12",
       "jsr:@joyautomation/dark-matter@^0.0.27",
+      "jsr:@joyautomation/nats-schema@^0.0.1",
+      "jsr:@joyautomation/synapse@^0.0.85",
       "jsr:@nats-io/jetstream@3.3",
       "jsr:@nats-io/transport-deno@3.3",
       "npm:long@^5.3.2",

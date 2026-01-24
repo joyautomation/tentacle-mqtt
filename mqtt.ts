@@ -5,7 +5,7 @@
 
 import { connect, type NatsConnection } from "@nats-io/transport-deno";
 import { jetstream } from "@nats-io/jetstream";
-import { disconnectNode, setValue } from "@joyautomation/synapse";
+import { disconnectNode, setValue, addMetrics } from "@joyautomation/synapse";
 import type {
   SparkplugCreateNodeInput,
   SparkplugNode,
@@ -314,8 +314,8 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
         // Update synapse device metrics
         const deviceId = config.mqtt.edgeNode;
         if (!node.devices[deviceId].metrics[variableId]) {
-          // Create new metric if it didn't exist at birth
-          node.devices[deviceId].metrics[variableId] = createMetric(
+          // Create new metric and add it via addMetrics (triggers rebirth)
+          const newMetric = createMetric(
             variableId,
             value,
             datatype,
@@ -326,7 +326,8 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
             "plc", // source
             "good", // quality
           );
-          log.info(`New metric discovered: ${variableId}`);
+          log.info(`New metric discovered: ${variableId}, adding to device`);
+          await addMetrics(node, { [variableId]: newMetric }, deviceId);
         }
 
         // Use setValue to update and publish DDATA (handles RBE/deadband)
