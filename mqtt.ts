@@ -16,7 +16,7 @@ import {
   plcToSparkplugType,
   sparkplugToPLCValue,
 } from "./types/mappings.ts";
-import { NATS_TOPICS, substituteTopic } from "@tentacle/nats-schema";
+import { NATS_TOPICS, substituteTopic } from "@joyautomation/nats-schema";
 import { createLogger, LogLevel } from "@joyautomation/coral";
 
 const log = createLogger("mqtt-bridge", LogLevel.info);
