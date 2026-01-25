@@ -4,8 +4,7 @@
  */
 
 import { connect, type NatsConnection } from "@nats-io/transport-deno";
-import { jetstream } from "@nats-io/jetstream";
-import { disconnectNode, setValue, addMetrics } from "@joyautomation/synapse";
+import { disconnectNode, setValue, addMetrics, publishDeviceBirth, publishDeviceData } from "@joyautomation/synapse";
 import type {
   SparkplugCreateNodeInput,
   SparkplugNode,
@@ -13,13 +12,12 @@ import type {
 import type { BridgeConfig } from "./types/config.ts";
 import {
   createMetric,
-  plcToSparkplugType,
   sparkplugToPLCValue,
 } from "./types/mappings.ts";
 import { NATS_TOPICS, substituteTopic } from "@joyautomation/nats-schema";
 import { createLogger, LogLevel } from "@joyautomation/coral";
 
-const log = createLogger("mqtt-bridge", LogLevel.info);
+const log = createLogger("mqtt-bridge", LogLevel.debug);
 
 type PlcVariable = {
   id: string;
@@ -30,13 +28,10 @@ type PlcVariable = {
   disableRBE?: boolean;
 };
 
-type KVEntry = {
-  data: Uint8Array;
-};
-
 /**
  * Setup MQTT Sparkplug B bridge
- * Discovers PLC variables from NATS KV and creates a bidirectional bridge
+ * Subscribes to MQTT-enabled variables from NATS and bridges to Sparkplug B.
+ * Variables are added dynamically as they arrive (triggers rebirth).
  */
 export async function setupSparkplugBridge(config: BridgeConfig) {
   log.info("Initializing Sparkplug B bridge...");
@@ -53,146 +48,29 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
 
   log.info("Connected to NATS");
 
-  // Get JetStream for KV access
-  const js = jetstream(nc);
-  const jsm = await js.jetstreamManager();
-  const kvBucketName = `plc-variables-${config.projectId}`;
-  const streamName = `$KV_${kvBucketName}`;
-  const subjectPrefix = `$KV.${kvBucketName}`;
-
-  // Variables will be discovered from NATS messages
-  log.info("Waiting for initial PLC variables from NATS...");
+  // Track discovered variables
   const variables = new Map<string, PlcVariable>();
 
-  // Subscribe to PLC data to collect initial variables
-  const plcDataTopic = substituteTopic(NATS_TOPICS.plc.data, {
+  // Subscribe to MQTT-specific topics (only MQTT-enabled variables)
+  const mqttDataTopic = substituteTopic(NATS_TOPICS.plc.data, {
     projectId: config.projectId,
     variableId: "*",
   });
 
-  log.info(`Subscribing to NATS topic: ${plcDataTopic}`);
-  // Create a temporary subscription for initial variable collection
-  const initSub = nc.subscribe(plcDataTopic);
+  log.info(`Subscribing to NATS topic: ${mqttDataTopic}`);
+  const sub = nc.subscribe(mqttDataTopic);
 
-  // Collect initial variables with timeout and early exit when stable
-  const collectInitialVariables = new Promise<void>((resolve) => {
-    let resolved = false;
-    let stabilityCounter = 0;
-    const stabilityThreshold = 10; // 10 iterations with no new variables = stable
-
-    const timeout = setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        initSub.unsubscribe();
-        resolve();
-      }
-    }, 5000); // Wait up to 5 seconds for initial variables
-
-    (async () => {
-      for await (const msg of initSub) {
-        try {
-          const data = JSON.parse(msg.string()) as {
-            projectId: string;
-            variableId: string;
-            value: unknown;
-            timestamp: number;
-            datatype: "number" | "boolean" | "string" | "udt";
-            deadband?: { value: number; maxTime?: number };
-            disableRBE?: boolean;
-          };
-
-          const { variableId, value, datatype, deadband, disableRBE } = data;
-          if (!variables.has(variableId)) {
-            variables.set(variableId, {
-              id: variableId,
-              description: `${config.projectId}/${variableId}`,
-              datatype,
-              value: value as
-                | number
-                | boolean
-                | string
-                | Record<string, unknown>,
-              deadband,
-              disableRBE,
-            });
-            log.debug(
-              `Discovered variable during init: ${variableId} (${datatype})`,
-            );
-            stabilityCounter = 0; // Reset stability counter when we find a new variable
-          } else {
-            stabilityCounter++;
-            // If we've seen the same variables repeated, they're stable
-            if (stabilityCounter >= stabilityThreshold && variables.size > 0) {
-              if (!resolved) {
-                resolved = true;
-                clearTimeout(timeout);
-                initSub.unsubscribe();
-                resolve();
-              }
-              break;
-            }
-          }
-        } catch (e) {
-          log.warn("Error parsing NATS message:", (e as Error).message);
-        }
-      }
-      if (!resolved) {
-        resolved = true;
-        clearTimeout(timeout);
-        resolve();
-      }
-    })();
-  });
-
-  // Wait for initial variables to arrive
-  await collectInitialVariables;
-  log.info(`Collected ${variables.size} variables for initialization`);
-
-  // If we didn't discover any variables, request them from the PLC
-  if (variables.size === 0) {
-    const requestSubject = substituteTopic(NATS_TOPICS.plc.variablesRequest, {
-      projectId: config.projectId,
-    });
-    log.info(`No variables discovered, requesting from PLC: ${requestSubject}`);
-    nc.publish(requestSubject, "");
-  }
-
-  // Create a new subscription for ongoing updates
-  const sub = nc.subscribe(plcDataTopic);
-
-  // Create Sparkplug B node (synapse)
+  // Create Sparkplug B node (synapse) - starts with empty device
   const { createNode } = await import("@joyautomation/synapse");
 
   // Parse MQTT broker URL
   const brokerUrl = config.mqtt.brokerUrl.replace(/^mqtt:\/\//, "tcp://")
-    .replace(
-      /^mqtts:\/\//,
-      "tls://",
-    );
+    .replace(/^mqtts:\/\//, "tls://");
 
   log.info(`Creating Sparkplug B node: ${config.mqtt.edgeNode}`);
 
-  // Pre-populate device metrics with discovered variables
-  // createMetric returns Synapse SparkplugMetric objects compatible with node config
-  const deviceMetrics: Record<string, unknown> = {};
-  for (const [variableId, variable] of variables.entries()) {
-    deviceMetrics[variableId] = createMetric(
-      variable.id,
-      variable.value,
-      variable.datatype,
-      Date.now(),
-      undefined, // scanRate
-      variable.deadband,
-      variable.disableRBE,
-      "plc", // source
-      "good", // quality
-    );
-  }
-
   let node: SparkplugNode;
   try {
-    // Build config object for synapse createNode
-    // See: https://github.com/joyautomation/synapse
     const nodeConfig = {
       id: config.mqtt.edgeNode,
       brokerUrl,
@@ -201,12 +79,11 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
       version: "spBv1.0",
       username: config.mqtt.username || "",
       password: config.mqtt.password || "",
-      metrics: {}, // Root-level metrics (node birth)
+      metrics: {},
       devices: {
-        // Device data with pre-populated metrics
         [config.mqtt.edgeNode]: {
           id: config.mqtt.edgeNode,
-          metrics: deviceMetrics,
+          metrics: {}, // Start empty, variables added as they arrive
         },
       },
     } as SparkplugCreateNodeInput;
@@ -224,22 +101,17 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
     if (message.metrics) {
       for (const metric of message.metrics) {
         const metricName = metric.name as string;
-        // Extract variable ID from metric name (strip folder prefix like "Device Control/")
         const variableId = metricName.includes("/")
           ? metricName.split("/").pop()!
           : metricName;
         const variable = variables.get(variableId);
 
-        // Always forward command to NATS - even if variable not discovered yet
-        // The PLC will receive it if subscribed to the subject
         const commandSubject = `${config.projectId}/${variableId}`;
 
-        // Convert value based on known datatype or infer from metric value type
         let convertedValue: number | boolean | string | Record<string, unknown>;
         if (variable) {
           convertedValue = sparkplugToPLCValue(metric.value, variable.datatype);
         } else {
-          // Infer type from the metric value
           const rawValue = metric.value;
           if (typeof rawValue === "boolean") {
             convertedValue = rawValue;
@@ -256,11 +128,9 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
         log.info(`Publishing command to ${commandSubject}: ${convertedValue}`);
         nc.publish(commandSubject, String(convertedValue));
 
-        // Update local state if variable is known
         if (variable) {
           variable.value = convertedValue;
           const deviceId = config.mqtt.edgeNode;
-          // Use original metric name for synapse (it may include folder prefix)
           if (node.devices[deviceId]?.metrics[metricName]) {
             await setValue(node, metricName, convertedValue, deviceId);
           } else if (node.devices[deviceId]?.metrics[variableId]) {
@@ -271,8 +141,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
     }
   });
 
-  // Continue processing NATS messages for ongoing updates
-  // (the collection has already started in parallel and will complete)
+  // Process NATS messages - add new variables dynamically (triggers rebirth)
   (async () => {
     for await (const msg of sub) {
       try {
@@ -286,21 +155,25 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
           disableRBE?: boolean;
         };
 
-        const { variableId, value, datatype, deadband, disableRBE } = data;
+        const { variableId, value, deadband, disableRBE } = data;
+        const deviceId = config.mqtt.edgeNode;
 
-        // Update existing variable (or create if new)
-        const variable = variables.get(variableId);
-        if (variable) {
-          variable.value = value as
-            | number
-            | boolean
-            | string
-            | Record<string, unknown>;
-          // Update metadata if provided
-          if (deadband !== undefined) variable.deadband = deadband;
-          if (disableRBE !== undefined) variable.disableRBE = disableRBE;
+        // Infer correct datatype from actual value (workaround for UDT template parsing bug)
+        let datatype = data.datatype;
+        if (typeof value === "number" && datatype !== "number") {
+          log.debug(`Correcting datatype for ${variableId}: ${datatype} -> number (value is ${value})`);
+          datatype = "number";
+        } else if (typeof value === "boolean" && datatype !== "boolean") {
+          datatype = "boolean";
+        }
+
+        // Update or create variable in local tracking
+        const existing = variables.get(variableId);
+        if (existing) {
+          existing.value = value as number | boolean | string | Record<string, unknown>;
+          if (deadband !== undefined) existing.deadband = deadband;
+          if (disableRBE !== undefined) existing.disableRBE = disableRBE;
         } else {
-          // New variable discovered after initialization
           variables.set(variableId, {
             id: variableId,
             description: `${config.projectId}/${variableId}`,
@@ -311,38 +184,75 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
           });
         }
 
-        // Update synapse device metrics
-        const deviceId = config.mqtt.edgeNode;
-        if (!node.devices[deviceId].metrics[variableId]) {
-          // Create new metric and add it via addMetrics (triggers rebirth)
+        // Add new metric to device if not exists
+        const isNewMetric = !node.devices[deviceId].metrics[variableId];
+        if (isNewMetric) {
           const newMetric = createMetric(
             variableId,
             value,
             datatype,
             Date.now(),
-            undefined, // scanRate
+            undefined,
             deadband,
             disableRBE,
-            "plc", // source
-            "good", // quality
+            "plc",
+            "good",
           );
-          log.info(`New metric discovered: ${variableId}, adding to device`);
-          await addMetrics(node, { [variableId]: newMetric }, deviceId);
+          log.info(`New metric: ${variableId}, adding to device and triggering rebirth`);
+          addMetrics(node, { [variableId]: newMetric }, deviceId);
+
+          // Trigger device rebirth to include new metric in DBIRTH
+          if (node.mqtt) {
+            const device = node.devices[deviceId];
+            const mqttConfig = {
+              version: node.version || "spBv1.0",
+              groupId: node.groupId,
+              edgeNode: node.id,
+            };
+            const birthPayload = {
+              timestamp: Date.now(),
+              metrics: Object.values(device.metrics).map(m => ({
+                ...m,
+                timestamp: Date.now(),
+              })),
+            };
+            publishDeviceBirth(node, birthPayload, mqttConfig, node.mqtt, deviceId);
+            log.info(`Published DBIRTH for device ${deviceId} with ${Object.keys(device.metrics).length} metrics`);
+          }
         }
 
-        // Use setValue to update and publish DDATA (handles RBE/deadband)
-        await setValue(node, variableId, value, deviceId);
+        // Update value via setValue
+        const result = await setValue(node, variableId, value, deviceId);
 
-        log.debug(`Updated metric: ${variableId} = ${value} (${datatype})`);
+        // Manually publish DDATA since synapse's RBE may not trigger
+        if (node.mqtt && !isNewMetric) {
+          const metric = node.devices[deviceId]?.metrics[variableId];
+          if (metric) {
+            const mqttConfig = {
+              version: node.version || "spBv1.0",
+              groupId: node.groupId,
+              edgeNode: node.id,
+            };
+            const ddataPayload = {
+              timestamp: Date.now(),
+              metrics: [{
+                ...metric,
+                value,
+                timestamp: Date.now(),
+              }],
+            };
+            publishDeviceData(node, ddataPayload, mqttConfig, node.mqtt, deviceId);
+            log.debug(`Published DDATA for ${variableId} = ${value}`);
+          }
+        }
       } catch (error) {
         log.error("Error processing NATS message:", error);
       }
     }
   })();
 
-  log.info(`Synapse bridge initialized with ${variables.size} variables`);
+  log.info("Bridge ready - variables will be added as they arrive from NATS");
 
-  // Return manager interface
   return {
     variables,
     sparkplugNode: node,
