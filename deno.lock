@@ -7,6 +7,8 @@
     "jsr:@joyautomation/nats-schema@^0.0.1": "0.0.1",
     "jsr:@joyautomation/synapse@^0.0.85": "0.0.85",
     "jsr:@nats-io/jetstream@3.3": "3.3.0",
+    "jsr:@nats-io/jetstream@3.3.0": "3.3.0",
+    "jsr:@nats-io/kv@3": "3.3.0",
     "jsr:@nats-io/nats-core@3.3.0": "3.3.0",
     "jsr:@nats-io/nkeys@2.0.3": "2.0.3",
     "jsr:@nats-io/nuid@2.0.3": "2.0.3",
@@ -53,6 +55,13 @@
     "@nats-io/jetstream@3.3.0": {
       "integrity": "131ca1ee63dc41fb4a79b8e27d0b2367dc4b3974aac8047b83757f38db85f3b4",
       "dependencies": [
+        "jsr:@nats-io/nats-core"
+      ]
+    },
+    "@nats-io/kv@3.3.0": {
+      "integrity": "5aadf754bc74dc6c6423b7341c36a7612461a211d470e22cd59b78e4d6eecd6b",
+      "dependencies": [
+        "jsr:@nats-io/jetstream@3.3.0",
         "jsr:@nats-io/nats-core"
       ]
     },
@@ -427,6 +436,7 @@
       "jsr:@joyautomation/nats-schema@^0.0.1",
       "jsr:@joyautomation/synapse@^0.0.85",
       "jsr:@nats-io/jetstream@3.3",
+      "jsr:@nats-io/kv@3",
       "jsr:@nats-io/transport-deno@3.3",
       "npm:long@^5.3.2",
       "npm:mqtt@^5.14.1",
