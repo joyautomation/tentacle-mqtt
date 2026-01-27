@@ -5,7 +5,7 @@
   "imports": {
     "@joyautomation/coral": "jsr:@joyautomation/coral@^0.0.12",
     "@joyautomation/dark-matter": "jsr:@joyautomation/dark-matter@^0.0.27",
-    "@joyautomation/synapse": "jsr:@joyautomation/synapse@^0.0.85",
+    "@joyautomation/synapse": "jsr:@joyautomation/synapse@^0.0.87",
     "@nats-io/transport-deno": "jsr:@nats-io/transport-deno@3.3",
     "@nats-io/jetstream": "jsr:@nats-io/jetstream@3.3",
     "@nats-io/kv": "jsr:@nats-io/kv@3",

@@ -234,50 +234,61 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
     log.warn(`Could not fetch initial variables: ${e}. Will populate as data arrives.`);
   }
 
+  // Log MQTT connection events (useful for debugging)
+  if (node.events) {
+    node.events.on("error", (err: Error) => log.error("MQTT error:", err));
+  }
+
   // Handle device commands (DCMD) from MQTT
-  node.events?.on("dcmd", async (_topic: string, message: any) => {
-    log.info("Received DCMD:", message);
+  // Synapse 0.0.87+ preserves external event listeners during reconnection cycles
+  // Event signature: (topic: SparkplugTopic, payload: UPayload)
+  node.events.on("dcmd", async (topic: any, payload: { metrics?: any[] }) => {
+    try {
+      log.info(`Received DCMD for device ${topic.deviceId}`);
 
-    if (message.metrics) {
-      for (const metric of message.metrics) {
-        const metricName = metric.name as string;
-        const variableId = metricName.includes("/")
-          ? metricName.split("/").pop()!
-          : metricName;
-        const variable = variables.get(variableId);
+      if (payload.metrics) {
+        for (const metric of payload.metrics) {
+          const metricName = metric.name as string;
+          const variableId = metricName.includes("/")
+            ? metricName.split("/").pop()!
+            : metricName;
+          const variable = variables.get(variableId);
 
-        const commandSubject = `${config.projectId}/${variableId}`;
+          const commandSubject = `${config.projectId}/${variableId}`;
 
-        let convertedValue: number | boolean | string | Record<string, unknown>;
-        if (variable) {
-          convertedValue = sparkplugToPLCValue(metric.value, variable.datatype);
-        } else {
-          const rawValue = metric.value;
-          if (typeof rawValue === "boolean") {
-            convertedValue = rawValue;
-          } else if (typeof rawValue === "number") {
-            convertedValue = rawValue;
-          } else if (typeof rawValue === "string") {
-            convertedValue = rawValue;
+          let convertedValue: number | boolean | string | Record<string, unknown>;
+          if (variable) {
+            convertedValue = sparkplugToPLCValue(metric.value, variable.datatype);
           } else {
-            convertedValue = String(rawValue);
+            const rawValue = metric.value;
+            if (typeof rawValue === "boolean") {
+              convertedValue = rawValue;
+            } else if (typeof rawValue === "number") {
+              convertedValue = rawValue;
+            } else if (typeof rawValue === "string") {
+              convertedValue = rawValue;
+            } else {
+              convertedValue = String(rawValue);
+            }
+            log.info(`Variable ${variableId} not yet discovered, forwarding raw value`);
           }
-          log.info(`Variable ${variableId} not yet discovered, forwarding raw value`);
-        }
 
-        log.info(`Publishing command to ${commandSubject}: ${convertedValue}`);
-        nc.publish(commandSubject, String(convertedValue));
+          log.info(`Publishing command to ${commandSubject}: ${convertedValue}`);
+          nc.publish(commandSubject, new TextEncoder().encode(String(convertedValue)));
 
-        if (variable) {
-          variable.value = convertedValue;
-          const deviceId = config.mqtt.edgeNode;
-          if (node.devices[deviceId]?.metrics[metricName]) {
-            await setValue(node, metricName, convertedValue, deviceId);
-          } else if (node.devices[deviceId]?.metrics[variableId]) {
-            await setValue(node, variableId, convertedValue, deviceId);
+          if (variable) {
+            variable.value = convertedValue;
+            const deviceId = config.mqtt.edgeNode;
+            if (node.devices[deviceId]?.metrics[metricName]) {
+              await setValue(node, metricName, convertedValue, deviceId);
+            } else if (node.devices[deviceId]?.metrics[variableId]) {
+              await setValue(node, variableId, convertedValue, deviceId);
+            }
           }
         }
       }
+    } catch (err) {
+      log.error("Error handling DCMD:", err);
     }
   });
 
