@@ -50,6 +50,184 @@ type MqttConfigState = {
   enabledVariables: Map<string, { deadband?: { value: number; maxTime?: number | null } | null }>;
 };
 
+/** Batch message format from tentacle-ethernetip */
+type BatchMessage = {
+  projectId: string;
+  deviceId: string;
+  timestamp: number;
+  values: Array<{
+    variableId: string;
+    value: number | boolean | string;
+    datatype: string;
+    deadband?: { value: number; maxTime?: number };
+  }>;
+};
+
+/**
+ * Process a batch message and publish a single DDATA with multiple metrics
+ * This is much more efficient than publishing individual DDATA per metric
+ */
+async function processBatchMessage(
+  data: BatchMessage,
+  node: SparkplugNode,
+  variables: Map<string, PlcVariable>,
+  mqttConfigState: MqttConfigState,
+  configBucket: Awaited<ReturnType<Kvm["open"]>> | null,
+  config: BridgeConfig,
+): Promise<void> {
+  const deviceId = config.mqtt.edgeNode;
+  const now = Date.now();
+
+  // Track which metrics to include in DDATA (variableId -> value)
+  const ddataValues: Map<string, number | boolean | string> = new Map();
+
+  // Variables requiring rebirth (new or type-changed)
+  let needsRebirth = false;
+
+  for (const item of data.values) {
+    const { variableId, value } = item;
+
+    // Check if this variable is enabled for MQTT publishing
+    const variableConfig = mqttConfigState.enabledVariables.get(variableId);
+    if (configBucket && !variableConfig) {
+      // Variable not enabled for MQTT - skip
+      continue;
+    }
+
+    // Get deadband config
+    let deadband: { value: number; maxTime?: number } | undefined;
+    if (variableConfig?.deadband) {
+      deadband = {
+        value: variableConfig.deadband.value,
+        maxTime: variableConfig.deadband.maxTime ?? undefined,
+      };
+    } else if (configBucket) {
+      deadband = {
+        value: mqttConfigState.defaults.value,
+        maxTime: mqttConfigState.defaults.maxTime ?? undefined,
+      };
+    } else if (item.deadband) {
+      deadband = item.deadband;
+    }
+
+    // Infer correct datatype from actual value
+    let datatype = item.datatype as "number" | "boolean" | "string" | "udt";
+    if (typeof value === "number" && datatype !== "number") {
+      datatype = "number";
+    } else if (typeof value === "boolean" && datatype !== "boolean") {
+      datatype = "boolean";
+    }
+
+    // Update or create variable in local tracking
+    const existing = variables.get(variableId);
+    if (existing) {
+      existing.value = value;
+      existing.deadband = deadband;
+      if (existing.datatype !== datatype) {
+        existing.datatype = datatype;
+      }
+    } else {
+      variables.set(variableId, {
+        id: variableId,
+        description: `${config.projectId}/${variableId}`,
+        datatype,
+        value,
+        deadband,
+      });
+    }
+
+    // Check if metric exists
+    const existingMetric = node.devices[deviceId]?.metrics[variableId];
+    const isNewMetric = !existingMetric;
+
+    // Check if existing metric has wrong Sparkplug type
+    let needsTypeCorrection = false;
+    if (existingMetric) {
+      const expectedType = datatype === "number" ? "double" : datatype === "boolean" ? "boolean" : "string";
+      if ((existingMetric.type as string) !== expectedType) {
+        needsTypeCorrection = true;
+      }
+    }
+
+    if (isNewMetric || needsTypeCorrection) {
+      // New metric or type correction - add to node (will trigger rebirth later)
+      const newMetric = createMetric(
+        variableId,
+        value,
+        datatype,
+        now,
+        undefined,
+        deadband,
+        undefined,
+        "plc",
+        "good",
+      );
+
+      if (needsTypeCorrection) {
+        log.info(`Batch: correcting metric type for ${variableId}`);
+        delete node.devices[deviceId].metrics[variableId];
+      } else {
+        log.info(`Batch: new metric ${variableId}`);
+      }
+
+      addMetrics(node, { [variableId]: newMetric }, deviceId);
+      needsRebirth = true;
+    } else {
+      // Existing metric - add to DDATA batch
+      ddataValues.set(variableId, value);
+    }
+  }
+
+  // If any new metrics were added, trigger rebirth
+  if (needsRebirth && node.mqtt) {
+    const device = node.devices[deviceId];
+    const mqttConfig = {
+      version: node.version || "spBv1.0",
+      groupId: node.groupId,
+      edgeNode: node.id,
+    } as any;
+    const birthPayload = {
+      timestamp: now,
+      metrics: Object.values(device.metrics).map(m => ({
+        ...m,
+        value: typeof m.value === "function" ? m.value() : m.value,
+        timestamp: now,
+      })),
+    } as any;
+    publishDeviceBirth(node, birthPayload, mqttConfig, node.mqtt, deviceId);
+    log.info(`Published DBIRTH for device ${deviceId} with ${Object.keys(device.metrics).length} metrics`);
+  }
+
+  // Publish DDATA with all metrics that didn't need rebirth
+  if (ddataValues.size > 0 && node.mqtt) {
+    const mqttConfig = {
+      version: node.version || "spBv1.0",
+      groupId: node.groupId,
+      edgeNode: node.id,
+    } as any;
+
+    // Build metrics array from existing metrics with new values
+    const ddataMetrics = [];
+    for (const [variableId, value] of ddataValues) {
+      const metric = node.devices[deviceId]?.metrics[variableId];
+      if (metric) {
+        ddataMetrics.push({
+          ...metric,
+          value,
+          timestamp: now,
+        });
+      }
+    }
+
+    const ddataPayload = {
+      timestamp: now,
+      metrics: ddataMetrics,
+    } as any;
+    publishDeviceData(node, ddataPayload, mqttConfig, node.mqtt, deviceId);
+    log.debug(`Published batch DDATA with ${ddataMetrics.length} metrics`);
+  }
+}
+
 /**
  * Setup MQTT Sparkplug B bridge
  * Subscribes to MQTT-enabled variables from NATS and bridges to Sparkplug B.
@@ -224,9 +402,10 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
         timestamp: Date.now(),
         metrics: Object.values(device.metrics).map(m => ({
           ...m,
+          value: typeof m.value === "function" ? m.value() : m.value,
           timestamp: Date.now(),
         })),
-      };
+      } as any;
       publishDeviceBirth(node, birthPayload, mqttConfig, node.mqtt, deviceId);
       log.info(`Published initial DBIRTH with ${Object.keys(device.metrics).length} metrics`);
     }
@@ -293,10 +472,21 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
   });
 
   // Process NATS messages - filter by MQTT config, add new variables dynamically
+  // Supports both single-value and batch formats
   (async () => {
     for await (const msg of sub) {
       try {
-        const data = JSON.parse(msg.string()) as {
+        const rawData = JSON.parse(msg.string());
+
+        // Detect batch vs single-value format
+        if (rawData.values && Array.isArray(rawData.values)) {
+          // Batch format: { projectId, deviceId, timestamp, values: [...] }
+          await processBatchMessage(rawData, node, variables, mqttConfigState, configBucket, config);
+          continue;
+        }
+
+        // Single-value format (backwards compatibility)
+        const data = rawData as {
           projectId: string;
           variableId: string;
           value: unknown;
@@ -419,16 +609,17 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
               timestamp: Date.now(),
               metrics: Object.values(device.metrics).map(m => ({
                 ...m,
+                value: typeof m.value === "function" ? m.value() : m.value,
                 timestamp: Date.now(),
               })),
-            };
+            } as any;
             publishDeviceBirth(node, birthPayload, mqttConfig, node.mqtt, deviceId);
             log.info(`Published DBIRTH for device ${deviceId} with ${Object.keys(device.metrics).length} metrics${needsTypeCorrection ? ' (type correction)' : ''}`);
           }
         }
 
         // Update value via setValue
-        const result = await setValue(node, variableId, value, deviceId);
+        const result = await setValue(node, variableId, value as any, deviceId);
 
         // Manually publish DDATA since synapse's RBE may not trigger
         // Skip if we just published rebirth (new metric or type correction)
@@ -447,7 +638,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
                 value,
                 timestamp: Date.now(),
               }],
-            };
+            } as any;
             publishDeviceData(node, ddataPayload, mqttConfig, node.mqtt, deviceId);
             log.debug(`Published DDATA for ${variableId} = ${value}`);
           }
