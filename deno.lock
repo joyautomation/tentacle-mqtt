@@ -5,7 +5,6 @@
     "jsr:@joyautomation/dark-matter@^0.0.26": "0.0.26",
     "jsr:@joyautomation/dark-matter@^0.0.27": "0.0.27",
     "jsr:@joyautomation/synapse@^0.0.87": "0.0.87",
-    "jsr:@joyautomation/tentacle-nats-schema@^0.0.1": "0.0.1",
     "jsr:@nats-io/jetstream@3.3": "3.3.0",
     "jsr:@nats-io/jetstream@3.3.0": "3.3.0",
     "jsr:@nats-io/kv@3": "3.3.0",
@@ -46,9 +45,6 @@
         "npm:pako",
         "npm:sparkplug-payload"
       ]
-    },
-    "@joyautomation/tentacle-nats-schema@0.0.1": {
-      "integrity": "05ab61f736ed2c22e979aafba75079e3af23c4f160c484d46f2ccbdaec65c9d5"
     },
     "@nats-io/jetstream@3.3.0": {
       "integrity": "131ca1ee63dc41fb4a79b8e27d0b2367dc4b3974aac8047b83757f38db85f3b4",
@@ -432,7 +428,6 @@
       "jsr:@joyautomation/coral@^0.0.12",
       "jsr:@joyautomation/dark-matter@^0.0.27",
       "jsr:@joyautomation/synapse@^0.0.87",
-      "jsr:@joyautomation/tentacle-nats-schema@^0.0.1",
       "jsr:@nats-io/jetstream@3.3",
       "jsr:@nats-io/kv@3",
       "jsr:@nats-io/transport-deno@3.3",

@@ -9,7 +9,7 @@
     "@nats-io/transport-deno": "jsr:@nats-io/transport-deno@3.3",
     "@nats-io/jetstream": "jsr:@nats-io/jetstream@3.3",
     "@nats-io/kv": "jsr:@nats-io/kv@3",
-    "@joyautomation/nats-schema": "jsr:@joyautomation/tentacle-nats-schema@^0.0.1",
+    "@joyautomation/nats-schema": "../tentacle-nats-schema/src/mod.ts",
     "long": "npm:long@^5.3.2",
     "mqtt": "npm:mqtt@^5.14.1",
     "pako": "npm:pako@^2.1.0",

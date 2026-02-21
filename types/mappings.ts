@@ -75,6 +75,8 @@ export function createMetric(
   disableRBE?: boolean,
   source?: string,
   quality?: string,
+  moduleId?: string,
+  description?: string,
 ): SparkplugMetric {
   const sparkplugType = plcToSparkplugType(plcDatatype);
   let convertedValue: number | boolean | string | null = null;
@@ -158,6 +160,18 @@ export function createMetric(
         type: "Int32",
       };
     }
+  }
+  if (moduleId) {
+    metric.properties.moduleId = {
+      value: moduleId,
+      type: "String",
+    };
+  }
+  if (description) {
+    metric.properties.description = {
+      value: description,
+      type: "String",
+    };
   }
 
   return metric;

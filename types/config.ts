@@ -26,7 +26,6 @@ export type NatsConfig = {
 export type BridgeConfig = {
   mqtt: MqttConfig;
   nats: NatsConfig;
-  projectId: string;
   deviceId?: string; // Optional: if set, use DDATA instead of NDATA
 };
 
@@ -72,15 +71,9 @@ export function loadNatsConfig(): NatsConfig {
  * Load bridge configuration from environment variables
  */
 export function loadBridgeConfig(): BridgeConfig {
-  const projectId = Deno.env.get("PROJECT_ID");
-  if (!projectId) {
-    throw new Error("PROJECT_ID environment variable is required");
-  }
-
   return {
     mqtt: loadMqttConfig(),
     nats: loadNatsConfig(),
-    projectId,
     deviceId: Deno.env.get("MQTT_DEVICE_ID"),
   };
 }

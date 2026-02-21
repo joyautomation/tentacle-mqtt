@@ -1,12 +1,10 @@
 /**
  * MQTT Sparkplug B bridge for tentacle-mqtt
- * Bridges PLC variables from NATS to MQTT using Sparkplug B specification
- * Watches mqtt-config KV bucket for real-time configuration updates
+ * Pure forwarder: publishes all NATS variable data to MQTT Sparkplug B.
+ * Deadband/RBE settings come from the NATS message metadata (set by tentacle-plc).
  */
 
 import { connect, type NatsConnection } from "@nats-io/transport-deno";
-import { jetstream } from "@nats-io/jetstream";
-import { Kvm } from "@nats-io/kv";
 import { disconnectNode, setValue, addMetrics, publishDeviceBirth, publishDeviceData } from "@joyautomation/synapse";
 import type {
   SparkplugCreateNodeInput,
@@ -17,7 +15,7 @@ import {
   createMetric,
   sparkplugToPLCValue,
 } from "./types/mappings.ts";
-import { NATS_TOPICS, substituteTopic } from "@joyautomation/nats-schema";
+import { NATS_SUBSCRIPTIONS, substituteTopic, NATS_TOPICS } from "@joyautomation/nats-schema";
 import { createLogger, LogLevel } from "@joyautomation/coral";
 
 const log = createLogger("mqtt-bridge", LogLevel.debug);
@@ -29,30 +27,99 @@ type PlcVariable = {
   value: number | boolean | string | Record<string, unknown>;
   deadband?: { value: number; maxTime?: number };
   disableRBE?: boolean;
+  /** The moduleId of the source module that published this variable */
+  moduleId: string;
 };
 
-/** MQTT config structure from KV bucket (matches tentacle-graphql format) */
-type MqttVariableConfig = {
-  enabled: boolean;
-  deadband?: { value: number; maxTime?: number };
+// =============================================================================
+// RBE (Report By Exception) — local deadband checking
+// Synapse's metricNeedsToPublish uses seconds; our maxTime is in milliseconds.
+// We track publish state ourselves so the units stay consistent.
+// =============================================================================
+
+type RBEState = {
+  lastPublishedValue: number | boolean | string | Record<string, unknown>;
+  lastPublishedTime: number; // Date.now() ms
 };
 
-type MqttDefaults = {
-  deadband: { value: number; maxTime?: number };
-};
+const rbeState = new Map<string, RBEState>();
 
-// Variables are stored as a Record<variableId, config>
-type MqttVariablesRecord = Record<string, MqttVariableConfig>;
+function shouldPublish(
+  variableId: string,
+  value: unknown,
+  deadband?: { value: number; maxTime?: number },
+  disableRBE?: boolean,
+): boolean {
+  if (!deadband) return true;
+  if (disableRBE) return true;
 
-/** Runtime MQTT config with lookup map */
-type MqttConfigState = {
-  defaults: { value: number; maxTime?: number | null };
-  enabledVariables: Map<string, { deadband?: { value: number; maxTime?: number | null } | null }>;
-};
+  const state = rbeState.get(variableId);
+  if (!state) return true; // never published — always publish
+
+  const now = Date.now();
+  const elapsed = now - state.lastPublishedTime;
+
+  // maxTime exceeded — force publish
+  if (deadband.maxTime && elapsed >= deadband.maxTime) return true;
+
+  // Numeric deadband threshold
+  if (typeof value === "number" && typeof state.lastPublishedValue === "number") {
+    return Math.abs(value - state.lastPublishedValue) > deadband.value;
+  }
+
+  // Non-numeric — publish on any change
+  return value !== state.lastPublishedValue;
+}
+
+function recordPublish(variableId: string, value: unknown): void {
+  rbeState.set(variableId, {
+    lastPublishedValue: value as number | boolean | string | Record<string, unknown>,
+    lastPublishedTime: Date.now(),
+  });
+}
+
+// =============================================================================
+// Rebirth batching — collect new metrics and send ONE DBIRTH after a quiet period
+// =============================================================================
+
+const REBIRTH_DEBOUNCE_MS = 500;
+let rebirthTimer: ReturnType<typeof setTimeout> | null = null;
+let rebirthPending = false;
+
+function scheduleRebirth(
+  node: SparkplugNode,
+  deviceId: string,
+  config: BridgeConfig,
+): void {
+  rebirthPending = true;
+  if (rebirthTimer) clearTimeout(rebirthTimer);
+  rebirthTimer = setTimeout(() => {
+    rebirthTimer = null;
+    rebirthPending = false;
+    if (!node.mqtt) return;
+    const device = node.devices[deviceId];
+    if (!device) return;
+    const mqttConfig = {
+      version: node.version || "spBv1.0",
+      groupId: node.groupId,
+      edgeNode: node.id,
+    } as any;
+    const birthPayload = {
+      timestamp: Date.now(),
+      metrics: Object.values(device.metrics).map(m => ({
+        ...m,
+        value: typeof m.value === "function" ? m.value() : m.value,
+        timestamp: Date.now(),
+      })),
+    } as any;
+    publishDeviceBirth(node, birthPayload, mqttConfig, node.mqtt, deviceId);
+    log.info(`Published batched DBIRTH for device ${deviceId} with ${Object.keys(device.metrics).length} metrics`);
+  }, REBIRTH_DEBOUNCE_MS);
+}
 
 /** Batch message format from tentacle-ethernetip */
 type BatchMessage = {
-  projectId: string;
+  moduleId: string;
   deviceId: string;
   timestamp: number;
   values: Array<{
@@ -71,9 +138,8 @@ async function processBatchMessage(
   data: BatchMessage,
   node: SparkplugNode,
   variables: Map<string, PlcVariable>,
-  mqttConfigState: MqttConfigState,
-  configBucket: Awaited<ReturnType<Kvm["open"]>> | null,
   config: BridgeConfig,
+  sourceModuleId: string,
 ): Promise<void> {
   const deviceId = config.mqtt.edgeNode;
   const now = Date.now();
@@ -87,28 +153,8 @@ async function processBatchMessage(
   for (const item of data.values) {
     const { variableId, value } = item;
 
-    // Check if this variable is enabled for MQTT publishing
-    const variableConfig = mqttConfigState.enabledVariables.get(variableId);
-    if (configBucket && !variableConfig) {
-      // Variable not enabled for MQTT - skip
-      continue;
-    }
-
-    // Get deadband config
-    let deadband: { value: number; maxTime?: number } | undefined;
-    if (variableConfig?.deadband) {
-      deadband = {
-        value: variableConfig.deadband.value,
-        maxTime: variableConfig.deadband.maxTime ?? undefined,
-      };
-    } else if (configBucket) {
-      deadband = {
-        value: mqttConfigState.defaults.value,
-        maxTime: mqttConfigState.defaults.maxTime ?? undefined,
-      };
-    } else if (item.deadband) {
-      deadband = item.deadband;
-    }
+    // Get deadband from the NATS message
+    const deadband = item.deadband;
 
     // Infer correct datatype from actual value
     let datatype = item.datatype as "number" | "boolean" | "string" | "udt";
@@ -129,10 +175,11 @@ async function processBatchMessage(
     } else {
       variables.set(variableId, {
         id: variableId,
-        description: `${config.projectId}/${variableId}`,
+        description: `${sourceModuleId}/${variableId}`,
         datatype,
         value,
         deadband,
+        moduleId: sourceModuleId,
       });
     }
 
@@ -161,6 +208,7 @@ async function processBatchMessage(
         undefined,
         "plc",
         "good",
+        sourceModuleId,
       );
 
       if (needsTypeCorrection) {
@@ -171,35 +219,25 @@ async function processBatchMessage(
       }
 
       addMetrics(node, { [variableId]: newMetric }, deviceId);
+      recordPublish(variableId, value);
       needsRebirth = true;
     } else {
-      // Existing metric - add to DDATA batch
-      ddataValues.set(variableId, value);
+      // Existing metric — only add to DDATA batch if RBE check passes
+      const batchVar = variables.get(variableId);
+      if (shouldPublish(variableId, value, batchVar?.deadband)) {
+        ddataValues.set(variableId, value);
+        recordPublish(variableId, value);
+      }
     }
   }
 
-  // If any new metrics were added, trigger rebirth
-  if (needsRebirth && node.mqtt) {
-    const device = node.devices[deviceId];
-    const mqttConfig = {
-      version: node.version || "spBv1.0",
-      groupId: node.groupId,
-      edgeNode: node.id,
-    } as any;
-    const birthPayload = {
-      timestamp: now,
-      metrics: Object.values(device.metrics).map(m => ({
-        ...m,
-        value: typeof m.value === "function" ? m.value() : m.value,
-        timestamp: now,
-      })),
-    } as any;
-    publishDeviceBirth(node, birthPayload, mqttConfig, node.mqtt, deviceId);
-    log.info(`Published DBIRTH for device ${deviceId} with ${Object.keys(device.metrics).length} metrics`);
+  // If any new metrics were added, schedule batched rebirth
+  if (needsRebirth) {
+    scheduleRebirth(node, deviceId, config);
   }
 
-  // Publish DDATA with all metrics that didn't need rebirth
-  if (ddataValues.size > 0 && node.mqtt) {
+  // Publish DDATA with all metrics that didn't need rebirth (skip if rebirth pending)
+  if (ddataValues.size > 0 && node.mqtt && !rebirthPending) {
     const mqttConfig = {
       version: node.version || "spBv1.0",
       groupId: node.groupId,
@@ -230,8 +268,7 @@ async function processBatchMessage(
 
 /**
  * Setup MQTT Sparkplug B bridge
- * Subscribes to MQTT-enabled variables from NATS and bridges to Sparkplug B.
- * Watches mqtt-config KV bucket for real-time configuration changes.
+ * Subscribes to all variable data from NATS and bridges to Sparkplug B.
  * Variables are added dynamically as they arrive (triggers rebirth).
  */
 export async function setupSparkplugBridge(config: BridgeConfig) {
@@ -249,40 +286,11 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
 
   log.info("Connected to NATS");
 
-  // Setup JetStream and KV for mqtt-config bucket
-  const js = jetstream(nc);
-  const kvm = new Kvm(js);
-  const configBucketName = `mqtt-config-${config.projectId}`;
-
-  // MQTT config state - updated in real-time from KV bucket
-  const mqttConfigState: MqttConfigState = {
-    defaults: { value: 0, maxTime: null },
-    enabledVariables: new Map(),
-  };
-
-  // Load and watch mqtt-config bucket
-  let configBucket: Awaited<ReturnType<typeof kvm.open>> | null = null;
-  try {
-    configBucket = await kvm.open(configBucketName);
-    log.info(`Opened mqtt-config bucket: ${configBucketName}`);
-
-    // Load initial config
-    await loadMqttConfig(configBucket, mqttConfigState);
-
-    // Watch for config changes
-    watchMqttConfig(configBucket, mqttConfigState);
-  } catch (e) {
-    log.warn(`Could not open mqtt-config bucket (${configBucketName}): ${e}. All variables will be published.`);
-  }
-
   // Track discovered variables
   const variables = new Map<string, PlcVariable>();
 
-  // Subscribe to all PLC data topics
-  const mqttDataTopic = substituteTopic(NATS_TOPICS.plc.data, {
-    projectId: config.projectId,
-    variableId: "*",
-  });
+  // Subscribe to all module data topics (*.data.>)
+  const mqttDataTopic = NATS_SUBSCRIPTIONS.allData();
 
   log.info(`Subscribing to NATS topic: ${mqttDataTopic}`);
   const sub = nc.subscribe(mqttDataTopic);
@@ -306,7 +314,13 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
       version: "spBv1.0",
       username: config.mqtt.username || "",
       password: config.mqtt.password || "",
-      metrics: {},
+      metrics: {
+        platform: {
+          name: "platform",
+          value: "tentacle",
+          type: "string" as never,
+        },
+      },
       devices: {
         [config.mqtt.edgeNode]: {
           id: config.mqtt.edgeNode,
@@ -321,97 +335,9 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
     throw e;
   }
 
-  // Request current variables from tentacle-ethernetip and populate initial metrics
+  // Metrics start empty — PLC data messages populate them as they arrive (with deadband).
+  // Raw ethernetip data is skipped; the PLC processes it and republishes.
   const deviceId = config.mqtt.edgeNode;
-  try {
-    const variablesSubject = `plc.variables.${config.projectId}`;
-    log.info(`Requesting current variables from ${variablesSubject}...`);
-
-    const response = await nc.request(variablesSubject, new TextEncoder().encode(""), { timeout: 5000 });
-    const allVariables = JSON.parse(new TextDecoder().decode(response.data)) as Array<{
-      deviceId: string;
-      variableId: string;
-      value: unknown;
-      datatype: "number" | "boolean" | "string" | "udt";
-      quality: string;
-      source: string;
-      lastUpdated: number;
-    }>;
-
-    log.info(`Received ${allVariables.length} variables from PLC scanner`);
-
-    // Filter to only MQTT-enabled variables
-    const enabledVariables = configBucket
-      ? allVariables.filter(v => mqttConfigState.enabledVariables.has(v.variableId))
-      : allVariables;
-
-    log.info(`${enabledVariables.length} variables enabled for MQTT`);
-
-    // Add each enabled variable to the device metrics
-    for (const v of enabledVariables) {
-      const variableConfig = mqttConfigState.enabledVariables.get(v.variableId);
-
-      // Determine deadband config
-      let deadband: { value: number; maxTime?: number } | undefined;
-      if (variableConfig?.deadband) {
-        deadband = {
-          value: variableConfig.deadband.value,
-          maxTime: variableConfig.deadband.maxTime ?? undefined,
-        };
-      } else if (configBucket) {
-        deadband = {
-          value: mqttConfigState.defaults.value,
-          maxTime: mqttConfigState.defaults.maxTime ?? undefined,
-        };
-      }
-
-      // Track the variable locally
-      variables.set(v.variableId, {
-        id: v.variableId,
-        description: `${config.projectId}/${v.variableId}`,
-        datatype: v.datatype,
-        value: v.value as number | boolean | string | Record<string, unknown>,
-        deadband,
-      });
-
-      // Add metric to device
-      const metric = createMetric(
-        v.variableId,
-        v.value,
-        v.datatype,
-        Date.now(),
-        undefined,
-        deadband,
-        undefined,
-        "plc",
-        "good",
-      );
-      addMetrics(node, { [v.variableId]: metric }, deviceId);
-    }
-
-    // Trigger initial DBIRTH with populated metrics
-    if (node.mqtt && enabledVariables.length > 0) {
-      const device = node.devices[deviceId];
-      // Note: mqttConfig type cast needed due to synapse type mismatch (works at runtime)
-      const mqttConfig = {
-        version: node.version || "spBv1.0",
-        groupId: node.groupId,
-        edgeNode: node.id,
-      } as any;
-      const birthPayload = {
-        timestamp: Date.now(),
-        metrics: Object.values(device.metrics).map(m => ({
-          ...m,
-          value: typeof m.value === "function" ? m.value() : m.value,
-          timestamp: Date.now(),
-        })),
-      } as any;
-      publishDeviceBirth(node, birthPayload, mqttConfig, node.mqtt, deviceId);
-      log.info(`Published initial DBIRTH with ${Object.keys(device.metrics).length} metrics`);
-    }
-  } catch (e) {
-    log.warn(`Could not fetch initial variables: ${e}. Will populate as data arrives.`);
-  }
 
   // Log MQTT connection events (useful for debugging)
   if (node.events) {
@@ -428,12 +354,21 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
       if (payload.metrics) {
         for (const metric of payload.metrics) {
           const metricName = metric.name as string;
-          const variableId = metricName.includes("/")
-            ? metricName.split("/").pop()!
-            : metricName;
-          const variable = variables.get(variableId);
+          // Try full metric name first (for hierarchical names like eth0/config/dhcp4)
+          // Fall back to last segment for backward compatibility
+          let variableId = metricName;
+          let variable = variables.get(variableId);
+          if (!variable && metricName.includes("/")) {
+            variableId = metricName.split("/").pop()!;
+            variable = variables.get(variableId);
+          }
 
-          const commandSubject = `${config.projectId}/${variableId}`;
+          // Route the command to the source module that owns this variable
+          const sourceModuleId = variable?.moduleId ?? "ethernetip";
+          const commandSubject = substituteTopic(NATS_TOPICS.module.command, {
+            moduleId: sourceModuleId,
+            variableId,
+          });
 
           let convertedValue: number | boolean | string | Record<string, unknown>;
           if (variable) {
@@ -449,7 +384,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
             } else {
               convertedValue = String(rawValue);
             }
-            log.info(`Variable ${variableId} not yet discovered, forwarding raw value`);
+            log.info(`Variable ${variableId} not yet discovered, forwarding raw value to ${sourceModuleId}`);
           }
 
           log.info(`Publishing command to ${commandSubject}: ${convertedValue}`);
@@ -471,60 +406,47 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
     }
   });
 
-  // Process NATS messages - filter by MQTT config, add new variables dynamically
+  // Process NATS messages — publish all variables to MQTT
   // Supports both single-value and batch formats
   (async () => {
     for await (const msg of sub) {
       try {
         const rawData = JSON.parse(msg.string());
 
-        // Detect batch vs single-value format
-        if (rawData.values && Array.isArray(rawData.values)) {
-          // Batch format: { projectId, deviceId, timestamp, values: [...] }
-          await processBatchMessage(rawData, node, variables, mqttConfigState, configBucket, config);
+        // Extract moduleId from NATS subject: {moduleId}.data.{variableId}
+        const subjectParts = msg.subject.split(".");
+        const sourceModuleId = subjectParts[0];
+
+        // Skip raw ethernetip data — the PLC processes it and republishes with deadband.
+        // MQTT only needs the PLC-processed values, not the raw scanner output.
+        if (sourceModuleId === "ethernetip") {
           continue;
         }
 
-        // Single-value format (backwards compatibility)
+        // Detect batch vs single-value format
+        if (rawData.values && Array.isArray(rawData.values)) {
+          // Batch format: { moduleId, deviceId, timestamp, values: [...] }
+          await processBatchMessage(rawData, node, variables, config, sourceModuleId);
+          continue;
+        }
+
+        // Single-value format
         const data = rawData as {
-          projectId: string;
+          moduleId: string;
           variableId: string;
           value: unknown;
           timestamp: number;
           datatype: "number" | "boolean" | "string" | "udt";
           deadband?: { value: number; maxTime?: number };
           disableRBE?: boolean;
+          description?: string;
         };
 
         const { variableId, value } = data;
         const deviceId = config.mqtt.edgeNode;
 
-        // Check if this variable is enabled for MQTT publishing
-        // If no config bucket exists, publish all variables (backwards compatibility)
-        const variableConfig = mqttConfigState.enabledVariables.get(variableId);
-        if (configBucket && !variableConfig) {
-          // Variable not enabled for MQTT - skip
-          continue;
-        }
-
-        // Get deadband config from KV bucket (takes priority) or fall back to NATS message
-        let deadband: { value: number; maxTime?: number } | undefined;
-        if (variableConfig?.deadband) {
-          deadband = {
-            value: variableConfig.deadband.value,
-            maxTime: variableConfig.deadband.maxTime ?? undefined,
-          };
-        } else if (configBucket) {
-          // Use defaults from config
-          deadband = {
-            value: mqttConfigState.defaults.value,
-            maxTime: mqttConfigState.defaults.maxTime ?? undefined,
-          };
-        } else if (data.deadband) {
-          // Fall back to NATS message deadband (backwards compatibility)
-          deadband = data.deadband;
-        }
-
+        // Get deadband from the NATS message
+        const deadband = data.deadband;
         const disableRBE = data.disableRBE;
 
         // Infer correct datatype from actual value (workaround for UDT template parsing bug)
@@ -550,11 +472,12 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
         } else {
           variables.set(variableId, {
             id: variableId,
-            description: `${config.projectId}/${variableId}`,
+            description: `${sourceModuleId}/${variableId}`,
             datatype,
             value: value as number | boolean | string | Record<string, unknown>,
             deadband,
             disableRBE,
+            moduleId: sourceModuleId,
           });
         }
 
@@ -563,11 +486,9 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
         const isNewMetric = !existingMetric;
 
         // Check if existing metric has wrong Sparkplug type (requires rebirth to fix)
-        // Sparkplug types: "double" for number, "boolean" for boolean
         let needsTypeCorrection = false;
         if (existingMetric) {
           const expectedType = datatype === "number" ? "double" : datatype === "boolean" ? "boolean" : "string";
-          // Cast to string for comparison since TypeStr is a string literal union
           if ((existingMetric.type as string) !== expectedType) {
             log.info(`Metric ${variableId} type mismatch: current=${existingMetric.type}, expected=${expectedType}. Will recreate metric.`);
             needsTypeCorrection = true;
@@ -585,6 +506,8 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
             disableRBE,
             "plc",
             "good",
+            sourceModuleId,
+            data.description,
           );
 
           if (needsTypeCorrection) {
@@ -596,36 +519,23 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
           }
 
           addMetrics(node, { [variableId]: newMetric }, deviceId);
+          recordPublish(variableId, value);
 
-          // Trigger device rebirth to update/add metric in DBIRTH
-          if (node.mqtt) {
-            const device = node.devices[deviceId];
-            const mqttConfig = {
-              version: node.version || "spBv1.0",
-              groupId: node.groupId,
-              edgeNode: node.id,
-            } as any;
-            const birthPayload = {
-              timestamp: Date.now(),
-              metrics: Object.values(device.metrics).map(m => ({
-                ...m,
-                value: typeof m.value === "function" ? m.value() : m.value,
-                timestamp: Date.now(),
-              })),
-            } as any;
-            publishDeviceBirth(node, birthPayload, mqttConfig, node.mqtt, deviceId);
-            log.info(`Published DBIRTH for device ${deviceId} with ${Object.keys(device.metrics).length} metrics${needsTypeCorrection ? ' (type correction)' : ''}`);
-          }
+          // Schedule batched rebirth (collects all new metrics over 500ms window)
+          scheduleRebirth(node, deviceId, config);
         }
 
-        // Update value via setValue
-        const result = await setValue(node, variableId, value as any, deviceId);
+        // Update value via setValue (in-memory only — does not publish)
+        await setValue(node, variableId, value as any, deviceId);
 
-        // Manually publish DDATA since synapse's RBE may not trigger
-        // Skip if we just published rebirth (new metric or type correction)
-        if (node.mqtt && !isNewMetric && !needsTypeCorrection) {
+        // Publish DDATA only if RBE check passes
+        // Skip if we just added a new metric or have a pending rebirth
+        const trackedVar = variables.get(variableId);
+        if (node.mqtt && !isNewMetric && !needsTypeCorrection && !rebirthPending &&
+            shouldPublish(variableId, value, trackedVar?.deadband, trackedVar?.disableRBE)) {
           const metric = node.devices[deviceId]?.metrics[variableId];
           if (metric) {
+            recordPublish(variableId, value);
             const mqttConfig = {
               version: node.version || "spBv1.0",
               groupId: node.groupId,
@@ -649,13 +559,12 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
     }
   })();
 
-  log.info("Bridge ready - variables will be added as they arrive from NATS (filtered by mqtt-config)");
+  log.info("Bridge ready — all variables from NATS will be published to MQTT");
 
   return {
     variables,
     sparkplugNode: node,
     natsConnection: nc,
-    mqttConfigState,
     disconnect: async () => {
       log.info("Disconnecting bridge...");
       sub.unsubscribe();
@@ -664,108 +573,4 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
       log.info("Bridge disconnected");
     },
   };
-}
-
-/**
- * Load MQTT config from KV bucket into state
- * Keys used by tentacle-graphql:
- *   mqtt.defaults   - { deadband: { value, maxTime } }
- *   mqtt.variables  - { [variableId]: { enabled, deadband? } }
- */
-async function loadMqttConfig(
-  bucket: Awaited<ReturnType<Kvm["open"]>>,
-  state: MqttConfigState,
-): Promise<void> {
-  // Load defaults
-  try {
-    const defaultsEntry = await bucket.get("mqtt.defaults");
-    if (defaultsEntry?.value) {
-      const defaults = defaultsEntry.json<MqttDefaults>();
-      state.defaults = {
-        value: defaults.deadband?.value ?? 0,
-        maxTime: defaults.deadband?.maxTime ?? null,
-      };
-      log.info(`Loaded mqtt defaults: ${JSON.stringify(state.defaults)}`);
-    }
-  } catch (e) {
-    log.warn(`Failed to load mqtt.defaults: ${e}`);
-  }
-
-  // Load variables
-  try {
-    const variablesEntry = await bucket.get("mqtt.variables");
-    if (variablesEntry?.value) {
-      const variables = variablesEntry.json<MqttVariablesRecord>();
-      updateVariablesState(variables, state);
-      log.info(`Loaded mqtt variables: ${state.enabledVariables.size} enabled`);
-    }
-  } catch (e) {
-    log.warn(`Failed to load mqtt.variables: ${e}`);
-  }
-}
-
-/**
- * Watch mqtt-config bucket for changes and update state in real-time
- */
-async function watchMqttConfig(
-  bucket: Awaited<ReturnType<Kvm["open"]>>,
-  state: MqttConfigState,
-): Promise<void> {
-  try {
-    // Watch all keys in the bucket
-    const watch = await bucket.watch();
-
-    (async () => {
-      for await (const entry of watch) {
-        const key = entry.key;
-
-        if (key === "mqtt.defaults") {
-          if (entry.value) {
-            const defaults = entry.json<MqttDefaults>();
-            state.defaults = {
-              value: defaults.deadband?.value ?? 0,
-              maxTime: defaults.deadband?.maxTime ?? null,
-            };
-            log.info(`mqtt.defaults updated: ${JSON.stringify(state.defaults)}`);
-          } else {
-            state.defaults = { value: 0, maxTime: null };
-            log.info("mqtt.defaults deleted, using defaults");
-          }
-        } else if (key === "mqtt.variables") {
-          if (entry.value) {
-            const variables = entry.json<MqttVariablesRecord>();
-            updateVariablesState(variables, state);
-            log.info(`mqtt.variables updated: ${state.enabledVariables.size} enabled`);
-          } else {
-            state.enabledVariables.clear();
-            log.info("mqtt.variables deleted, cleared enabled list");
-          }
-        }
-      }
-    })();
-
-    log.info("Watching mqtt-config bucket for changes");
-  } catch (e) {
-    log.warn(`Failed to watch mqtt-config bucket: ${e}`);
-  }
-}
-
-/**
- * Update enabled variables map from KV variables record
- */
-function updateVariablesState(
-  variables: MqttVariablesRecord,
-  state: MqttConfigState,
-): void {
-  state.enabledVariables.clear();
-  for (const [variableId, config] of Object.entries(variables)) {
-    if (config.enabled) {
-      state.enabledVariables.set(variableId, {
-        deadband: config.deadband ? {
-          value: config.deadband.value,
-          maxTime: config.deadband.maxTime ?? null,
-        } : null,
-      });
-    }
-  }
 }
