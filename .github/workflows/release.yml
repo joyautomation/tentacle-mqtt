@@ -14,7 +14,7 @@ jobs:
           path: tentacle-mqtt
 
       - name: Package source
-        run: tar czf tentacle-mqtt-src.tar.gz tentacle-mqtt/
+        run: tar czf tentacle-mqtt-src.tar.gz --exclude='.git' tentacle-mqtt/
 
       - uses: actions/upload-artifact@v4
         with:
