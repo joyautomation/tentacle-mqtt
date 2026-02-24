@@ -13,8 +13,12 @@ import type {
 import type { BridgeConfig } from "./types/config.ts";
 import {
   createMetric,
+  createTemplateDefinitionMetric,
+  createTemplateInstanceMetric,
+  flattenUdtToMetrics,
   sparkplugToPLCValue,
 } from "./types/mappings.ts";
+import type { UdtTemplateDefinition } from "@joyautomation/nats-schema";
 import { NATS_SUBSCRIPTIONS, substituteTopic, NATS_TOPICS } from "@joyautomation/nats-schema";
 import { createLogger, LogLevel } from "@joyautomation/coral";
 
@@ -29,6 +33,8 @@ type PlcVariable = {
   disableRBE?: boolean;
   /** The moduleId of the source module that published this variable */
   moduleId: string;
+  /** Sparkplug B UDT template definition (only for datatype "udt") */
+  udtTemplate?: UdtTemplateDefinition;
 };
 
 // =============================================================================
@@ -43,6 +49,13 @@ type RBEState = {
 };
 
 const rbeState = new Map<string, RBEState>();
+
+// =============================================================================
+// Template Definition Registry
+// Tracks which Sparkplug B template definitions have been added to the node
+// so we can include them in NBIRTH and avoid duplicate registration.
+// =============================================================================
+const knownTemplates = new Map<string, UdtTemplateDefinition>();
 
 function shouldPublish(
   variableId: string,
@@ -354,10 +367,25 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
       if (payload.metrics) {
         for (const metric of payload.metrics) {
           const metricName = metric.name as string;
-          // Try full metric name first (for hierarchical names like eth0/config/dhcp4)
-          // Fall back to last segment for backward compatibility
+          let variable = variables.get(metricName);
+
+          // Handle Template Instance DCMD: metric.value is a UTemplate with .metrics members
+          // Each changed member is routed as an individual command to the source module.
+          if (variable?.datatype === "udt" && variable.udtTemplate &&
+              metric.value && typeof metric.value === "object" &&
+              Array.isArray((metric.value as any).metrics)) {
+            const templateMembers = (metric.value as any).metrics as Array<{ name: string; value: unknown }>;
+            const sourceModuleId = variable.moduleId;
+            for (const member of templateMembers) {
+              const memberCommandSubject = `${sourceModuleId}.command.${metricName}/${member.name}`;
+              log.info(`Template DCMD: ${memberCommandSubject} = ${member.value}`);
+              nc.publish(memberCommandSubject, new TextEncoder().encode(String(member.value)));
+            }
+            continue;
+          }
+
+          // Scalar DCMD: try full metric name, fall back to last segment for backward compatibility
           let variableId = metricName;
-          let variable = variables.get(variableId);
           if (!variable && metricName.includes("/")) {
             variableId = metricName.split("/").pop()!;
             variable = variables.get(variableId);
@@ -440,6 +468,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
           deadband?: { value: number; maxTime?: number };
           disableRBE?: boolean;
           description?: string;
+          udtTemplate?: UdtTemplateDefinition;
         };
 
         const { variableId, value } = data;
@@ -464,6 +493,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
           existing.value = value as number | boolean | string | Record<string, unknown>;
           existing.deadband = deadband;
           if (disableRBE !== undefined) existing.disableRBE = disableRBE;
+          if (data.udtTemplate) existing.udtTemplate = data.udtTemplate;
           // Update datatype if it was corrected (e.g., from template parsing fix)
           if (existing.datatype !== datatype) {
             log.debug(`Updating stored datatype for ${variableId}: ${existing.datatype} -> ${datatype}`);
@@ -478,9 +508,83 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
             deadband,
             disableRBE,
             moduleId: sourceModuleId,
+            udtTemplate: data.udtTemplate,
           });
         }
 
+        // ── Template path (UDT with template definition) ──────────────────────
+        const udtTemplate = data.udtTemplate;
+        if (datatype === "udt" && udtTemplate) {
+          const udtValue = value as Record<string, unknown>;
+
+          if (config.useTemplates) {
+            // Register template definition on the device (for DBIRTH) if not known
+            if (!knownTemplates.has(udtTemplate.name)) {
+              knownTemplates.set(udtTemplate.name, udtTemplate);
+              const defMetric = createTemplateDefinitionMetric(udtTemplate);
+              addMetrics(node, { [udtTemplate.name]: defMetric }, deviceId);
+              log.info(`Registered Sparkplug B template definition: ${udtTemplate.name}`);
+            }
+
+            // Check if this Template Instance metric already exists on the device
+            const existingTpl = node.devices[deviceId]?.metrics[variableId];
+            const isNewTpl = !existingTpl;
+
+            const instanceMetric = createTemplateInstanceMetric(
+              variableId,
+              udtValue,
+              udtTemplate,
+              Date.now(),
+              "plc",
+              "good",
+              sourceModuleId,
+              data.description,
+            );
+
+            if (isNewTpl) {
+              log.info(`New template instance: ${variableId} (${udtTemplate.name})`);
+              addMetrics(node, { [variableId]: instanceMetric }, deviceId);
+              recordPublish(variableId, JSON.stringify(udtValue));
+              scheduleRebirth(node, deviceId, config);
+            } else {
+              // Publish only when content changes (compare JSON strings for equality)
+              if (shouldPublish(variableId, JSON.stringify(udtValue), undefined)) {
+                recordPublish(variableId, JSON.stringify(udtValue));
+                // Update stored metric value so future DBIRTH (rebirth) uses current data
+                if (node.devices[deviceId]?.metrics[variableId]) {
+                  node.devices[deviceId].metrics[variableId].value = instanceMetric.value as never;
+                }
+                if (node.mqtt && !rebirthPending) {
+                  const mqttConfig = { version: node.version || "spBv1.0", groupId: node.groupId, edgeNode: node.id } as any;
+                  publishDeviceData(node, { timestamp: Date.now(), metrics: [{ ...instanceMetric, timestamp: Date.now() }] } as any, mqttConfig, node.mqtt, deviceId);
+                  log.debug(`Published DDATA template instance: ${variableId}`);
+                }
+              }
+            }
+          } else {
+            // Flat mode: expand UDT members into individual metrics
+            const flatMetrics = flattenUdtToMetrics(variableId, udtValue, udtTemplate, Date.now(), "plc", "good", sourceModuleId);
+            for (const [flatName, flatMetric] of flatMetrics) {
+              const existingFlat = node.devices[deviceId]?.metrics[flatName];
+              const isNewFlat = !existingFlat;
+              if (isNewFlat) {
+                log.info(`New flat metric (from UDT): ${flatName}`);
+                addMetrics(node, { [flatName]: flatMetric }, deviceId);
+                recordPublish(flatName, flatMetric.value);
+              } else if (shouldPublish(flatName, flatMetric.value, undefined)) {
+                recordPublish(flatName, flatMetric.value);
+                if (node.mqtt && !rebirthPending) {
+                  const mqttConfig = { version: node.version || "spBv1.0", groupId: node.groupId, edgeNode: node.id } as any;
+                  publishDeviceData(node, { timestamp: Date.now(), metrics: [{ ...flatMetric, timestamp: Date.now() }] } as any, mqttConfig, node.mqtt, deviceId);
+                }
+              }
+              if (isNewFlat) scheduleRebirth(node, deviceId, config);
+            }
+          }
+          continue; // Skip the scalar metric path below
+        }
+
+        // ── Scalar path (number | boolean | string) ────────────────────────────
         // Check if metric exists and if its type needs to be updated
         const existingMetric = node.devices[deviceId].metrics[variableId];
         const isNewMetric = !existingMetric;

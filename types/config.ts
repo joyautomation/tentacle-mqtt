@@ -27,6 +27,10 @@ export type BridgeConfig = {
   mqtt: MqttConfig;
   nats: NatsConfig;
   deviceId?: string; // Optional: if set, use DDATA instead of NDATA
+  /** When true (default), UDT metrics with a template definition are published as
+   *  Sparkplug B Template Instances. When false, UDTs are flattened into individual
+   *  string/number/boolean metrics (old behaviour). Env: MQTT_USE_TEMPLATES */
+  useTemplates: boolean;
 };
 
 /**
@@ -71,9 +75,12 @@ export function loadNatsConfig(): NatsConfig {
  * Load bridge configuration from environment variables
  */
 export function loadBridgeConfig(): BridgeConfig {
+  const useTemplatesEnv = Deno.env.get("MQTT_USE_TEMPLATES");
   return {
     mqtt: loadMqttConfig(),
     nats: loadNatsConfig(),
     deviceId: Deno.env.get("MQTT_DEVICE_ID"),
+    // Default true — disable with MQTT_USE_TEMPLATES=false
+    useTemplates: useTemplatesEnv !== undefined ? useTemplatesEnv.toLowerCase() !== "false" : true,
   };
 }
