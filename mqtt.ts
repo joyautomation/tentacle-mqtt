@@ -63,24 +63,27 @@ function shouldPublish(
   deadband?: { value: number; maxTime?: number },
   disableRBE?: boolean,
 ): boolean {
-  if (!deadband) return true;
   if (disableRBE) return true;
 
   const state = rbeState.get(variableId);
   if (!state) return true; // never published — always publish
 
   const now = Date.now();
-  const elapsed = now - state.lastPublishedTime;
 
-  // maxTime exceeded — force publish
-  if (deadband.maxTime && elapsed >= deadband.maxTime) return true;
+  // If deadband configured, check maxTime override first
+  if (deadband) {
+    if (deadband.maxTime && (now - state.lastPublishedTime) >= deadband.maxTime) return true;
 
-  // Numeric deadband threshold
-  if (typeof value === "number" && typeof state.lastPublishedValue === "number") {
-    return Math.abs(value - state.lastPublishedValue) > deadband.value;
+    // Numeric deadband: only publish if change exceeds threshold
+    if (typeof value === "number" && typeof state.lastPublishedValue === "number") {
+      return Math.abs(value - state.lastPublishedValue) > deadband.value;
+    }
   }
 
-  // Non-numeric — publish on any change
+  // Default RBE: only publish on value change
+  if (typeof value === "object" && value !== null) {
+    return JSON.stringify(value) !== JSON.stringify(state.lastPublishedValue);
+  }
   return value !== state.lastPublishedValue;
 }
 
@@ -182,6 +185,7 @@ async function processBatchMessage(
     if (existing) {
       existing.value = value;
       existing.deadband = deadband;
+      existing.lastUpdated = Date.now();
       if (existing.datatype !== datatype) {
         existing.datatype = datatype;
       }
@@ -193,6 +197,7 @@ async function processBatchMessage(
         value,
         deadband,
         moduleId: sourceModuleId,
+        lastUpdated: Date.now(),
       });
     }
 
@@ -492,6 +497,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
         if (existing) {
           existing.value = value as number | boolean | string | Record<string, unknown>;
           existing.deadband = deadband;
+          existing.lastUpdated = Date.now();
           if (disableRBE !== undefined) existing.disableRBE = disableRBE;
           if (data.udtTemplate) existing.udtTemplate = data.udtTemplate;
           // Update datatype if it was corrected (e.g., from template parsing fix)
@@ -509,6 +515,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
             disableRBE,
             moduleId: sourceModuleId,
             udtTemplate: data.udtTemplate,
+            lastUpdated: Date.now(),
           });
         }
 
@@ -518,13 +525,23 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
           const udtValue = value as Record<string, unknown>;
 
           if (config.useTemplates) {
-            // Register template definition on the device (for DBIRTH) if not known
-            if (!knownTemplates.has(udtTemplate.name)) {
-              knownTemplates.set(udtTemplate.name, udtTemplate);
-              const defMetric = createTemplateDefinitionMetric(udtTemplate);
-              addMetrics(node, { [udtTemplate.name]: defMetric }, deviceId);
-              log.info(`Registered Sparkplug B template definition: ${udtTemplate.name}`);
+            // Register template definition (and any nested templates via templateRef)
+            const registerTemplate = (tmpl: UdtTemplateDefinition) => {
+              if (knownTemplates.has(tmpl.name)) return;
+              knownTemplates.set(tmpl.name, tmpl);
+              const defMetric = createTemplateDefinitionMetric(tmpl, knownTemplates);
+              addMetrics(node, { [tmpl.name]: defMetric }, deviceId);
+              log.info(`Registered Sparkplug B template definition: ${tmpl.name}`);
+            };
+            // Register nested templates first (depth-first) so definitions precede instances
+            for (const member of udtTemplate.members) {
+              if (member.templateRef && !knownTemplates.has(member.templateRef)) {
+                // Look for nested template definition in the message or known templates
+                // The PLC publishes all templates via NATS, so they accumulate in knownTemplates
+                // If not yet seen, it will be registered when its own variable arrives
+              }
             }
+            registerTemplate(udtTemplate);
 
             // Check if this Template Instance metric already exists on the device
             const existingTpl = node.devices[deviceId]?.metrics[variableId];
@@ -539,6 +556,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
               "good",
               sourceModuleId,
               data.description,
+              knownTemplates,
             );
 
             if (isNewTpl) {
@@ -665,12 +683,119 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
 
   log.info("Bridge ready — all variables from NATS will be published to MQTT");
 
+  // ── NATS request/reply handler for mqtt.metrics ───────────────────────────
+  const metricsSub = nc.subscribe(NATS_TOPICS.mqtt.metrics);
+  (async () => {
+    const encoder = new TextEncoder();
+    for await (const msg of metricsSub) {
+      try {
+        const metrics: Array<{
+          name: string;
+          sparkplugType: string;
+          value: unknown;
+          moduleId: string;
+          datatype: string;
+          templateRef?: string;
+        }> = [];
+
+        // Fetch current variable values from protocol scanners for enrichment
+        const decoder = new TextDecoder();
+        const eipVarMap = new Map<string, { value: unknown; quality: string; lastUpdated: number }>();
+        try {
+          const eipResp = await nc.request("ethernetip.variables", new Uint8Array(0), { timeout: 2000 });
+          const eipVars = JSON.parse(decoder.decode(eipResp.data)) as Array<{ variableId: string; value: unknown; quality: string; lastUpdated: number }>;
+          for (const v of eipVars) {
+            eipVarMap.set(v.variableId, { value: v.value, quality: v.quality, lastUpdated: v.lastUpdated });
+          }
+        } catch {
+          // EIP scanner may not be running — proceed without enrichment
+        }
+
+        const device = node.devices[deviceId];
+        if (device) {
+          for (const [name, metric] of Object.entries(device.metrics)) {
+            const variable = variables.get(name);
+            let metricValue: unknown = typeof metric.value === "function" ? metric.value() : metric.value;
+
+            // For template instances, enrich nested member values from tracked variables or EIP scanner
+            if (metricValue && typeof metricValue === "object" && "metrics" in (metricValue as Record<string, unknown>)) {
+              const tmplVal = metricValue as { isDefinition?: boolean; templateRef?: string; metrics?: Array<{ name: string; type: string; value: unknown }> };
+              if (!tmplVal.isDefinition && tmplVal.metrics) {
+                metricValue = {
+                  ...tmplVal,
+                  metrics: tmplVal.metrics.map(m => {
+                    const memberKey = `${name}.${m.name}`;
+                    // Try tracked variables first (from NATS data messages), then EIP scanner
+                    const memberVar = variables.get(memberKey);
+                    const eipVar = eipVarMap.get(memberKey);
+                    const resolvedValue = memberVar?.value ?? eipVar?.value ?? m.value;
+                    const resolvedTimestamp = memberVar?.lastUpdated ?? eipVar?.lastUpdated ?? null;
+                    return {
+                      ...m,
+                      value: resolvedValue,
+                      timestamp: resolvedTimestamp,
+                    };
+                  }),
+                };
+              }
+            }
+
+            // Resolve timestamp from tracked variable or EIP scanner
+            const eipVar = eipVarMap.get(name);
+            const metricTimestamp = variable?.lastUpdated ?? eipVar?.lastUpdated ?? null;
+
+            metrics.push({
+              name,
+              sparkplugType: String(metric.type ?? "unknown"),
+              value: metricValue,
+              moduleId: variable?.moduleId ?? "unknown",
+              datatype: variable?.datatype ?? "unknown",
+              templateRef: variable?.udtTemplate?.name,
+              timestamp: metricTimestamp,
+            });
+          }
+        }
+
+        const templates: Array<{
+          name: string;
+          version?: string;
+          members: Array<{ name: string; datatype: string; description?: string; templateRef?: string; isArray?: boolean }>;
+        }> = [];
+        for (const [, tmpl] of knownTemplates) {
+          templates.push({
+            name: tmpl.name,
+            version: tmpl.version,
+            members: tmpl.members.map(m => ({
+              name: m.name,
+              datatype: m.datatype,
+              description: m.description,
+              templateRef: m.templateRef,
+              isArray: m.isArray,
+            })),
+          });
+        }
+
+        const response = {
+          metrics,
+          templates,
+          deviceId,
+          timestamp: Date.now(),
+        };
+        msg.respond(encoder.encode(JSON.stringify(response)));
+      } catch (err) {
+        log.error("Error handling mqtt.metrics request:", err);
+        msg.respond(encoder.encode(JSON.stringify({ metrics: [], templates: [], deviceId, timestamp: Date.now() })));
+      }
+    }
+  })();
+
   return {
     variables,
     sparkplugNode: node,
     natsConnection: nc,
     disconnect: async () => {
       log.info("Disconnecting bridge...");
+      metricsSub.unsubscribe();
       sub.unsubscribe();
       disconnectNode(node);
       await nc.close();

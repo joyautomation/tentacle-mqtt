@@ -214,6 +214,55 @@ function convertMemberValue(
 }
 
 /**
+ * Build the metrics array for a template definition or instance,
+ * recursively handling nested templateRef members.
+ *
+ * @param members - Template member definitions
+ * @param value - UDT value object (null for definitions)
+ * @param isDefinition - true for definition stubs (null values), false for instance values
+ * @param allTemplates - Registry of all known templates (for resolving templateRef)
+ */
+function buildTemplateMetrics(
+  members: UdtTemplateDefinition["members"],
+  value: Record<string, unknown> | null,
+  isDefinition: boolean,
+  allTemplates?: ReadonlyMap<string, UdtTemplateDefinition>,
+): any[] {
+  return members.map((m) => {
+    // Nested template member?
+    if (m.templateRef && allTemplates) {
+      const nestedTemplate = allTemplates.get(m.templateRef);
+      if (nestedTemplate) {
+        const nestedValue = value && typeof value[m.name] === "object" && value[m.name] !== null
+          ? value[m.name] as Record<string, unknown>
+          : null;
+        return {
+          name: m.name,
+          type: "template" as never,
+          value: {
+            isDefinition,
+            templateRef: isDefinition ? "" : nestedTemplate.name,
+            version: isDefinition ? (nestedTemplate.version ?? "1.0") : "",
+            metrics: buildTemplateMetrics(
+              nestedTemplate.members,
+              nestedValue,
+              isDefinition,
+              allTemplates,
+            ),
+          },
+        };
+      }
+    }
+    // Primitive member
+    return {
+      name: m.name,
+      type: memberToSparkplugType(m.datatype) as never,
+      value: isDefinition ? null : convertMemberValue(value?.[m.name], m.datatype),
+    };
+  });
+}
+
+/**
  * Create a Sparkplug B Template Definition metric.
  * Published as a node-level metric in NBIRTH so consumers learn the schema.
  *
@@ -221,10 +270,14 @@ function convertMemberValue(
  *   type: "template"
  *   value.isDefinition: true
  *   value.templateRef: ""
- *   value.metrics: member stubs with null values
+ *   value.metrics: member stubs with null values (nested templates recurse)
+ *
+ * @param template - The UDT template definition
+ * @param allTemplates - Registry of all known templates (for resolving nested templateRef)
  */
 export function createTemplateDefinitionMetric(
   template: UdtTemplateDefinition,
+  allTemplates?: ReadonlyMap<string, UdtTemplateDefinition>,
 ): SparkplugMetric {
   return {
     name: template.name,
@@ -233,11 +286,7 @@ export function createTemplateDefinitionMetric(
       isDefinition: true,
       templateRef: "",
       version: template.version ?? "1.0",
-      metrics: template.members.map((m) => ({
-        name: m.name,
-        type: memberToSparkplugType(m.datatype) as never,
-        value: null,
-      })),
+      metrics: buildTemplateMetrics(template.members, null, true, allTemplates),
     } as any,
     timestamp: Date.now(),
   };
@@ -251,7 +300,9 @@ export function createTemplateDefinitionMetric(
  *   type: "template"
  *   value.isDefinition: false
  *   value.templateRef: template.name
- *   value.metrics: member values from the UDT value object
+ *   value.metrics: member values from the UDT value object (nested templates recurse)
+ *
+ * @param allTemplates - Registry of all known templates (for resolving nested templateRef)
  */
 export function createTemplateInstanceMetric(
   name: string,
@@ -262,6 +313,7 @@ export function createTemplateInstanceMetric(
   quality?: string,
   moduleId?: string,
   description?: string,
+  allTemplates?: ReadonlyMap<string, UdtTemplateDefinition>,
 ): SparkplugMetric {
   const metric: SparkplugMetric = {
     name,
@@ -270,11 +322,7 @@ export function createTemplateInstanceMetric(
       isDefinition: false,
       templateRef: template.name,
       version: "",
-      metrics: template.members.map((m) => ({
-        name: m.name,
-        type: memberToSparkplugType(m.datatype) as never,
-        value: convertMemberValue(value[m.name], m.datatype),
-      })),
+      metrics: buildTemplateMetrics(template.members, value, false, allTemplates),
     } as any,
     timestamp,
   };

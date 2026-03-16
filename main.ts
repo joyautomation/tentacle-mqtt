@@ -83,7 +83,15 @@ async function main() {
         startedAt,
         metadata: {
           brokerUrl: config.mqtt.brokerUrl,
+          clientId: config.mqtt.clientId,
+          groupId: config.mqtt.groupId,
           edgeNode: config.mqtt.edgeNode,
+          username: config.mqtt.username ?? "",
+          password: config.mqtt.password ? "••••••••" : "",
+          keepalive: String(config.mqtt.keepalive ?? 30),
+          tlsEnabled: String(config.mqtt.tlsEnabled ?? false),
+          useTemplates: String(config.useTemplates),
+          deviceId: config.deviceId ?? "",
         },
       };
       try {
