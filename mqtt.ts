@@ -586,7 +586,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
               scheduleRebirth(node, deviceId, config);
             } else {
               // Publish only when content changes (compare JSON strings for equality)
-              if (shouldPublish(variableId, JSON.stringify(udtValue), undefined)) {
+              if (shouldPublish(variableId, JSON.stringify(udtValue), existing?.deadband)) {
                 recordPublish(variableId, JSON.stringify(udtValue), variables);
                 // Update stored metric value so future DBIRTH (rebirth) uses current data
                 if (node.devices[deviceId]?.metrics[variableId]) {
@@ -609,7 +609,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
                 log.info(`New flat metric (from UDT): ${flatName}`);
                 addMetrics(node, { [flatName]: flatMetric }, deviceId);
                 recordPublish(flatName, flatMetric.value, variables);
-              } else if (shouldPublish(flatName, flatMetric.value, undefined)) {
+              } else if (shouldPublish(flatName, flatMetric.value, existing?.deadband)) {
                 recordPublish(flatName, flatMetric.value, variables);
                 if (node.mqtt && !rebirthPending) {
                   const mqttConfig = { version: node.version || "spBv1.0", groupId: node.groupId, edgeNode: node.id } as any;
