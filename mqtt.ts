@@ -513,20 +513,20 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
         }
 
         // Update or create variable in local tracking
-        const existing = variables.get(variableId);
-        if (existing) {
-          existing.value = value as number | boolean | string | Record<string, unknown>;
-          existing.deadband = deadband;
-          existing.lastUpdated = Date.now();
-          if (disableRBE !== undefined) existing.disableRBE = disableRBE;
-          if (data.udtTemplate) existing.udtTemplate = data.udtTemplate;
+        let tracked = variables.get(variableId);
+        if (tracked) {
+          tracked.value = value as number | boolean | string | Record<string, unknown>;
+          tracked.deadband = deadband;
+          tracked.lastUpdated = Date.now();
+          if (disableRBE !== undefined) tracked.disableRBE = disableRBE;
+          if (data.udtTemplate) tracked.udtTemplate = data.udtTemplate;
           // Update datatype if it was corrected (e.g., from template parsing fix)
-          if (existing.datatype !== datatype) {
-            log.debug(`Updating stored datatype for ${variableId}: ${existing.datatype} -> ${datatype}`);
-            existing.datatype = datatype;
+          if (tracked.datatype !== datatype) {
+            log.debug(`Updating stored datatype for ${variableId}: ${tracked.datatype} -> ${datatype}`);
+            tracked.datatype = datatype;
           }
         } else {
-          variables.set(variableId, {
+          tracked = {
             id: variableId,
             description: `${sourceModuleId}/${variableId}`,
             datatype,
@@ -536,7 +536,8 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
             moduleId: sourceModuleId,
             udtTemplate: data.udtTemplate,
             lastUpdated: Date.now(),
-          });
+          };
+          variables.set(variableId, tracked);
         }
 
         // ── Template path (UDT with template definition) ──────────────────────
@@ -586,7 +587,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
               scheduleRebirth(node, deviceId, config);
             } else {
               // Publish only when content changes (compare JSON strings for equality)
-              if (shouldPublish(variableId, JSON.stringify(udtValue), existing?.deadband)) {
+              if (shouldPublish(variableId, JSON.stringify(udtValue), tracked?.deadband)) {
                 recordPublish(variableId, JSON.stringify(udtValue), variables);
                 // Update stored metric value so future DBIRTH (rebirth) uses current data
                 if (node.devices[deviceId]?.metrics[variableId]) {
@@ -609,7 +610,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
                 log.info(`New flat metric (from UDT): ${flatName}`);
                 addMetrics(node, { [flatName]: flatMetric }, deviceId);
                 recordPublish(flatName, flatMetric.value, variables);
-              } else if (shouldPublish(flatName, flatMetric.value, existing?.deadband)) {
+              } else if (shouldPublish(flatName, flatMetric.value, tracked?.deadband)) {
                 recordPublish(flatName, flatMetric.value, variables);
                 if (node.mqtt && !rebirthPending) {
                   const mqttConfig = { version: node.version || "spBv1.0", groupId: node.groupId, edgeNode: node.id } as any;
