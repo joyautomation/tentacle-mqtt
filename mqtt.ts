@@ -29,12 +29,18 @@ type PlcVariable = {
   description: string;
   datatype: "number" | "boolean" | "string" | "udt";
   value: number | boolean | string | Record<string, unknown>;
+  /** Value that was last actually published to MQTT (post-RBE) */
+  publishedValue?: number | boolean | string | Record<string, unknown>;
   deadband?: { value: number; minTime?: number; maxTime?: number };
   disableRBE?: boolean;
   /** The moduleId of the source module that published this variable */
   moduleId: string;
   /** Sparkplug B UDT template definition (only for datatype "udt") */
   udtTemplate?: UdtTemplateDefinition;
+  /** Timestamp of last received NATS message */
+  lastUpdated?: number;
+  /** Timestamp of last actual MQTT publish (post-RBE) */
+  lastPublished?: number;
 };
 
 // =============================================================================
@@ -92,11 +98,20 @@ function shouldPublish(
   return value !== state.lastPublishedValue;
 }
 
-function recordPublish(variableId: string, value: unknown): void {
+function recordPublish(variableId: string, value: unknown, variables?: Map<string, PlcVariable>): void {
+  const now = Date.now();
   rbeState.set(variableId, {
     lastPublishedValue: value as number | boolean | string | Record<string, unknown>,
-    lastPublishedTime: Date.now(),
+    lastPublishedTime: now,
   });
+  // Update tracked variable with post-RBE publish state
+  if (variables) {
+    const tracked = variables.get(variableId);
+    if (tracked) {
+      tracked.publishedValue = value as PlcVariable["value"];
+      tracked.lastPublished = now;
+    }
+  }
 }
 
 // =============================================================================
@@ -242,14 +257,14 @@ async function processBatchMessage(
       }
 
       addMetrics(node, { [variableId]: newMetric }, deviceId);
-      recordPublish(variableId, value);
+      recordPublish(variableId, value, variables);
       needsRebirth = true;
     } else {
       // Existing metric — only add to DDATA batch if RBE check passes
       const batchVar = variables.get(variableId);
       if (shouldPublish(variableId, value, batchVar?.deadband)) {
         ddataValues.set(variableId, value);
-        recordPublish(variableId, value);
+        recordPublish(variableId, value, variables);
       }
     }
   }
@@ -567,12 +582,12 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
             if (isNewTpl) {
               log.info(`New template instance: ${variableId} (${udtTemplate.name})`);
               addMetrics(node, { [variableId]: instanceMetric }, deviceId);
-              recordPublish(variableId, JSON.stringify(udtValue));
+              recordPublish(variableId, JSON.stringify(udtValue), variables);
               scheduleRebirth(node, deviceId, config);
             } else {
               // Publish only when content changes (compare JSON strings for equality)
               if (shouldPublish(variableId, JSON.stringify(udtValue), undefined)) {
-                recordPublish(variableId, JSON.stringify(udtValue));
+                recordPublish(variableId, JSON.stringify(udtValue), variables);
                 // Update stored metric value so future DBIRTH (rebirth) uses current data
                 if (node.devices[deviceId]?.metrics[variableId]) {
                   node.devices[deviceId].metrics[variableId].value = instanceMetric.value as never;
@@ -593,9 +608,9 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
               if (isNewFlat) {
                 log.info(`New flat metric (from UDT): ${flatName}`);
                 addMetrics(node, { [flatName]: flatMetric }, deviceId);
-                recordPublish(flatName, flatMetric.value);
+                recordPublish(flatName, flatMetric.value, variables);
               } else if (shouldPublish(flatName, flatMetric.value, undefined)) {
-                recordPublish(flatName, flatMetric.value);
+                recordPublish(flatName, flatMetric.value, variables);
                 if (node.mqtt && !rebirthPending) {
                   const mqttConfig = { version: node.version || "spBv1.0", groupId: node.groupId, edgeNode: node.id } as any;
                   publishDeviceData(node, { timestamp: Date.now(), metrics: [{ ...flatMetric, timestamp: Date.now() }] } as any, mqttConfig, node.mqtt, deviceId);
@@ -646,7 +661,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
           }
 
           addMetrics(node, { [variableId]: newMetric }, deviceId);
-          recordPublish(variableId, value);
+          recordPublish(variableId, value, variables);
 
           // Schedule batched rebirth (collects all new metrics over 500ms window)
           scheduleRebirth(node, deviceId, config);
@@ -662,7 +677,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
             shouldPublish(variableId, value, trackedVar?.deadband, trackedVar?.disableRBE)) {
           const metric = node.devices[deviceId]?.metrics[variableId];
           if (metric) {
-            recordPublish(variableId, value);
+            recordPublish(variableId, value, variables);
             const mqttConfig = {
               version: node.version || "spBv1.0",
               groupId: node.groupId,
@@ -747,7 +762,8 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
 
             // Resolve timestamp from tracked variable or EIP scanner
             const eipVar = eipVarMap.get(name);
-            const metricTimestamp = variable?.lastUpdated ?? eipVar?.lastUpdated ?? null;
+            // Use post-RBE publish timestamp, not raw NATS receive time
+            const metricTimestamp = variable?.lastPublished ?? variable?.lastUpdated ?? eipVar?.lastUpdated ?? null;
 
             metrics.push({
               name,
