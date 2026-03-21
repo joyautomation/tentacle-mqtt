@@ -739,10 +739,19 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
             let metricValue: unknown = typeof metric.value === "function" ? metric.value() : metric.value;
 
             // For template instances, use the synapse metric value (last actually published)
-            // Do NOT enrich from tracked variables — those update on every NATS message
-            // regardless of RBE, so the web UI would show stale-looking timestamps
+            // but stamp each member with the parent's lastPublished timestamp for freshness
             if (metricValue && typeof metricValue === "object" && "metrics" in (metricValue as Record<string, unknown>)) {
-              // metricValue already contains what was last published to MQTT — use as-is
+              const tmplVal = metricValue as { metrics?: Array<{ name: string; type: string; value: unknown; timestamp?: number | null }> };
+              const parentTimestamp = variable?.lastPublished ?? variable?.lastUpdated ?? null;
+              if (tmplVal.metrics && parentTimestamp) {
+                metricValue = {
+                  ...tmplVal,
+                  metrics: tmplVal.metrics.map(m => ({
+                    ...m,
+                    timestamp: m.timestamp ?? parentTimestamp,
+                  })),
+                };
+              }
             }
 
             // Resolve timestamp from tracked variable or EIP scanner
