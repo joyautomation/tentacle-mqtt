@@ -5,6 +5,7 @@
     "jsr:@joyautomation/dark-matter@^0.0.26": "0.0.26",
     "jsr:@joyautomation/dark-matter@^0.0.27": "0.0.27",
     "jsr:@joyautomation/synapse@^0.0.87": "0.0.87",
+    "jsr:@joyautomation/tentacle-nats-schema@^0.0.6": "0.0.6",
     "jsr:@nats-io/jetstream@3.3": "3.3.0",
     "jsr:@nats-io/jetstream@3.3.0": "3.3.0",
     "jsr:@nats-io/kv@3": "3.3.0",
