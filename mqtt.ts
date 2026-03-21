@@ -29,7 +29,7 @@ type PlcVariable = {
   description: string;
   datatype: "number" | "boolean" | "string" | "udt";
   value: number | boolean | string | Record<string, unknown>;
-  deadband?: { value: number; maxTime?: number };
+  deadband?: { value: number; minTime?: number; maxTime?: number };
   disableRBE?: boolean;
   /** The moduleId of the source module that published this variable */
   moduleId: string;
@@ -147,7 +147,7 @@ type BatchMessage = {
     variableId: string;
     value: number | boolean | string;
     datatype: string;
-    deadband?: { value: number; maxTime?: number };
+    deadband?: { value: number; minTime?: number; maxTime?: number };
   }>;
 };
 
@@ -475,7 +475,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
           value: unknown;
           timestamp: number;
           datatype: "number" | "boolean" | "string" | "udt";
-          deadband?: { value: number; maxTime?: number };
+          deadband?: { value: number; minTime?: number; maxTime?: number };
           disableRBE?: boolean;
           description?: string;
           udtTemplate?: UdtTemplateDefinition;
