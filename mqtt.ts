@@ -60,7 +60,7 @@ const knownTemplates = new Map<string, UdtTemplateDefinition>();
 function shouldPublish(
   variableId: string,
   value: unknown,
-  deadband?: { value: number; maxTime?: number },
+  deadband?: { value: number; minTime?: number; maxTime?: number },
   disableRBE?: boolean,
 ): boolean {
   if (disableRBE) return true;
@@ -69,10 +69,15 @@ function shouldPublish(
   if (!state) return true; // never published — always publish
 
   const now = Date.now();
+  const elapsed = now - state.lastPublishedTime;
 
-  // If deadband configured, check maxTime override first
+  // If deadband configured, check maxTime/minTime and value threshold
   if (deadband) {
-    if (deadband.maxTime && (now - state.lastPublishedTime) >= deadband.maxTime) return true;
+    // MaxTime exceeded — force publish regardless of change or minTime
+    if (deadband.maxTime && elapsed >= deadband.maxTime) return true;
+
+    // MinTime not yet elapsed — suppress even if value changed enough
+    if (deadband.minTime && elapsed < deadband.minTime) return false;
 
     // Numeric deadband: only publish if change exceeds threshold
     if (typeof value === "number" && typeof state.lastPublishedValue === "number") {
