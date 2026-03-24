@@ -22,7 +22,12 @@ import type { UdtTemplateDefinition } from "@joyautomation/nats-schema";
 import { NATS_SUBSCRIPTIONS, substituteTopic, NATS_TOPICS } from "@joyautomation/nats-schema";
 import { createLogger, LogLevel } from "@joyautomation/coral";
 
-const log = createLogger("mqtt-bridge", LogLevel.debug);
+let log: ReturnType<typeof createLogger> = createLogger("mqtt-bridge", LogLevel.debug);
+
+/** Replace the bridge logger (e.g., with a NATS-enabled logger) */
+export function setBridgeLogger(logger: ReturnType<typeof createLogger>): void {
+  log = logger;
+}
 
 type PlcVariable = {
   id: string;
@@ -177,7 +182,7 @@ async function processBatchMessage(
   config: BridgeConfig,
   sourceModuleId: string,
 ): Promise<void> {
-  const deviceId = config.mqtt.edgeNode;
+  const deviceId = config.deviceId || config.mqtt.edgeNode;
   const now = Date.now();
 
   // Track which metrics to include in DDATA (variableId -> value)
@@ -327,6 +332,22 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
   // Track discovered variables
   const variables = new Map<string, PlcVariable>();
 
+  // Service enabled state — when false, skip publishing to MQTT
+  let bridgeEnabled = true;
+
+  // ── Store & Forward ─────────────────────────────────────────────────────
+  const { StoreForwardBuffer } = await import("./store-forward.ts");
+  const sfBuffer = new StoreForwardBuffer({
+    maxRecords: config.storeForward.maxRecords,
+    maxBytes: config.storeForward.maxBytes,
+    drainRate: config.storeForward.drainRate,
+  });
+
+  if (config.storeForward.primaryHostId) {
+    sfBuffer.setPrimaryHostId(config.storeForward.primaryHostId);
+    log.info(`Store & Forward enabled — monitoring primary host: ${config.storeForward.primaryHostId}`);
+  }
+
   // Subscribe to all module data topics (*.data.>)
   const mqttDataTopic = NATS_SUBSCRIPTIONS.allData();
 
@@ -360,8 +381,8 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
         },
       },
       devices: {
-        [config.mqtt.edgeNode]: {
-          id: config.mqtt.edgeNode,
+        [config.deviceId || config.mqtt.edgeNode]: {
+          id: config.deviceId || config.mqtt.edgeNode,
           metrics: {}, // Start empty, variables added as they arrive
         },
       },
@@ -375,11 +396,74 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
 
   // Metrics start empty — PLC data messages populate them as they arrive (with deadband).
   // Raw ethernetip data is skipped; the PLC processes it and republishes.
-  const deviceId = config.mqtt.edgeNode;
+  const deviceId = config.deviceId || config.mqtt.edgeNode;
 
   // Log MQTT connection events (useful for debugging)
   if (node.events) {
     node.events.on("error", (err: Error) => log.error("MQTT error:", err));
+
+    // Store & Forward: listen for STATE messages from primary host
+    if (config.storeForward.primaryHostId) {
+      node.events.on("state" as any, (state: string, hostId: string) => {
+        const online = state.toUpperCase() === "ONLINE";
+        sfBuffer.handleStateChange(hostId, online);
+      });
+
+      // Set up the publish callback for drain — decode, set isHistorical, re-encode
+      const spbPayload = await import("sparkplug-payload");
+      const spb = spbPayload.get("spBv1.0");
+
+      sfBuffer.setPublishCallback((topic: string, payload: Uint8Array, isHistorical: boolean) => {
+        if (node.mqtt && node.mqtt.connected) {
+          if (isHistorical) {
+            try {
+              // Decode, mark metrics as historical, re-encode
+              const decoded = spb.decodePayload(payload);
+              if (decoded.metrics) {
+                for (const metric of decoded.metrics) {
+                  metric.isHistorical = true;
+                }
+              }
+              const reEncoded = spb.encodePayload(decoded);
+              node.mqtt.publish(topic, Buffer.from(reEncoded), { qos: 0 });
+              return;
+            } catch {
+              // Fall through to publish as-is if decode fails
+            }
+          }
+          node.mqtt.publish(topic, Buffer.from(payload), { qos: 0 });
+        }
+      });
+
+      // Track metrics/sec from DDATA publishes
+      node.events.on("publish-ddata" as any, (_topic: string, payload: { metrics?: unknown[] }) => {
+        const count = payload?.metrics?.length ?? 1;
+        sfBuffer.recordPublish(count);
+      });
+
+      // Intercept MQTT client publish to buffer DDATA when host is offline
+      // We wrap the mqtt client's publish method so all DDATA goes through the buffer
+      const wrapMqttPublish = () => {
+        if (!node.mqtt) return;
+        const originalPublish = node.mqtt.publish.bind(node.mqtt);
+        node.mqtt.publish = function(topic: string, message: any, ...args: any[]) {
+          // Only buffer DDATA messages (not NBIRTH, DBIRTH, NDEATH, etc.)
+          if (typeof topic === 'string' && topic.includes('/DDATA/')) {
+            const payload = message instanceof Uint8Array ? message : new Uint8Array(message);
+            if (sfBuffer.add(topic, payload)) {
+              return this; // buffered, don't publish
+            }
+          }
+          return originalPublish(topic, message, ...args);
+        } as any;
+      };
+
+      // Wrap on initial connect and on reconnects
+      node.events.on("connected" as any, () => {
+        wrapMqttPublish();
+      });
+      if (node.mqtt) wrapMqttPublish();
+    }
   }
 
   // Handle device commands (DCMD) from MQTT
@@ -445,7 +529,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
 
           if (variable) {
             variable.value = convertedValue;
-            const deviceId = config.mqtt.edgeNode;
+            const deviceId = config.deviceId || config.mqtt.edgeNode;
             if (node.devices[deviceId]?.metrics[metricName]) {
               await setValue(node, metricName, convertedValue, deviceId);
             } else if (node.devices[deviceId]?.metrics[variableId]) {
@@ -464,15 +548,21 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
   (async () => {
     for await (const msg of sub) {
       try {
+        // Skip processing when bridge is disabled
+        if (!bridgeEnabled) continue;
+
         const rawData = JSON.parse(msg.string());
 
         // Extract moduleId from NATS subject: {moduleId}.data.{variableId}
         const subjectParts = msg.subject.split(".");
         const sourceModuleId = subjectParts[0];
 
-        // Skip raw ethernetip data — the PLC processes it and republishes with deadband.
-        // MQTT only needs the PLC-processed values, not the raw scanner output.
-        if (sourceModuleId === "ethernetip") {
+        // Skip raw scanner data — only PLC-processed values should reach MQTT.
+        // Scanners (ethernetip, snmp, opcua, modbus) publish raw data that the PLC
+        // processes and republishes with deadband/RBE. Network and nftables are
+        // exceptions as they don't have a PLC layer.
+        const scannerModules = new Set(["ethernetip", "snmp", "opcua", "modbus"]);
+        if (scannerModules.has(sourceModuleId)) {
           continue;
         }
 
@@ -497,7 +587,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
         };
 
         const { variableId, value } = data;
-        const deviceId = config.mqtt.edgeNode;
+        const deviceId = config.deviceId || config.mqtt.edgeNode;
 
         // Get deadband from the NATS message
         const deadband = data.deadband;
@@ -704,6 +794,76 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
 
   log.info("Bridge ready — all variables from NATS will be published to MQTT");
 
+  // ── Load all PLC variables on startup ─────────────────────────────────────
+  // Query all PLC services for their current variables so the bridge has
+  // the full metric set immediately, not just the ones that change.
+  (async () => {
+    // Wait briefly for PLC services to register heartbeats
+    await new Promise((r) => setTimeout(r, 3000));
+
+    try {
+      const { Kvm } = await import("@nats-io/kv");
+      const js = await import("@nats-io/jetstream").then((m) => m.jetstream(nc));
+      const kvm = new Kvm(js);
+      const heartbeatsKv = await kvm.create("service_heartbeats", { history: 1, ttl: 60 * 1000 });
+
+      const decoder = new TextDecoder();
+      const encoder = new TextEncoder();
+      const keys = await heartbeatsKv.keys();
+      const plcModules: string[] = [];
+
+      for await (const key of keys) {
+        try {
+          const entry = await heartbeatsKv.get(key);
+          if (entry?.value) {
+            const hb = JSON.parse(decoder.decode(entry.value));
+            if (hb.serviceType === "plc") {
+              plcModules.push(hb.moduleId);
+            }
+          }
+        } catch { /* skip */ }
+      }
+
+      log.info(`Found ${plcModules.length} PLC module(s): ${plcModules.join(", ")}`);
+
+      for (const moduleId of plcModules) {
+        try {
+          const resp = await nc.request(`${moduleId}.variables`, new Uint8Array(0), { timeout: 5000 });
+          const vars = JSON.parse(decoder.decode(resp.data)) as Array<{
+            moduleId: string;
+            variableId: string;
+            value: unknown;
+            datatype: string;
+            udtTemplate?: { name: string; version?: string; members: Array<{ name: string; datatype: string }> };
+          }>;
+
+          log.info(`Loading ${vars.length} variables from ${moduleId}`);
+
+          // Publish each variable as a NATS message to ourselves so the
+          // existing processing loop handles metric registration
+          for (const v of vars) {
+            const subject = `${moduleId}.data.${v.variableId}`;
+            const msg = {
+              moduleId: v.moduleId ?? moduleId,
+              variableId: v.variableId,
+              value: v.value,
+              timestamp: Date.now(),
+              datatype: v.datatype,
+              udtTemplate: v.udtTemplate,
+            };
+            nc.publish(subject, encoder.encode(JSON.stringify(msg)));
+          }
+
+          log.info(`Published ${vars.length} initial values from ${moduleId}`);
+        } catch (err) {
+          log.warn(`Failed to load variables from ${moduleId}: ${err}`);
+        }
+      }
+    } catch (err) {
+      log.warn(`Failed to load initial variables: ${err}`);
+    }
+  })();
+
   // ── NATS request/reply handler for mqtt.metrics ───────────────────────────
   const metricsSub = nc.subscribe(NATS_TOPICS.mqtt.metrics);
   (async () => {
@@ -718,19 +878,6 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
           datatype: string;
           templateRef?: string;
         }> = [];
-
-        // Fetch current variable values from protocol scanners for enrichment
-        const decoder = new TextDecoder();
-        const eipVarMap = new Map<string, { value: unknown; quality: string; lastUpdated: number }>();
-        try {
-          const eipResp = await nc.request("ethernetip.variables", new Uint8Array(0), { timeout: 2000 });
-          const eipVars = JSON.parse(decoder.decode(eipResp.data)) as Array<{ variableId: string; value: unknown; quality: string; lastUpdated: number }>;
-          for (const v of eipVars) {
-            eipVarMap.set(v.variableId, { value: v.value, quality: v.quality, lastUpdated: v.lastUpdated });
-          }
-        } catch {
-          // EIP scanner may not be running — proceed without enrichment
-        }
 
         const device = node.devices[deviceId];
         if (device) {
@@ -754,10 +901,8 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
               }
             }
 
-            // Resolve timestamp from tracked variable or EIP scanner
-            const eipVar = eipVarMap.get(name);
             // Use post-RBE publish timestamp, not raw NATS receive time
-            const metricTimestamp = variable?.lastPublished ?? variable?.lastUpdated ?? eipVar?.lastUpdated ?? null;
+            const metricTimestamp = variable?.lastPublished ?? variable?.lastUpdated ?? null;
 
             metrics.push({
               name,
@@ -804,12 +949,38 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
     }
   })();
 
+  // ── NATS request/reply handler for mqtt.store-forward status ────────────
+  const sfSub = nc.subscribe("mqtt.store-forward");
+  (async () => {
+    const encoder = new TextEncoder();
+    for await (const msg of sfSub) {
+      try {
+        const state = sfBuffer.getState();
+        const timeline = sfBuffer.getTimeline();
+        msg.respond(encoder.encode(JSON.stringify({ ...state, timeline })));
+      } catch (err) {
+        log.error("Error handling store-forward status request:", err);
+        msg.respond(encoder.encode(JSON.stringify({ error: String(err) })));
+      }
+    }
+  })();
+
   return {
     variables,
     sparkplugNode: node,
     natsConnection: nc,
+    storeForward: sfBuffer,
+    get enabled() { return bridgeEnabled; },
+    setEnabled(enabled: boolean) {
+      if (bridgeEnabled !== enabled) {
+        bridgeEnabled = enabled;
+        log.info(`Bridge ${enabled ? "ENABLED — resuming MQTT publishing" : "DISABLED — pausing MQTT publishing"}`);
+      }
+    },
     disconnect: async () => {
       log.info("Disconnecting bridge...");
+      sfBuffer.destroy();
+      sfSub.unsubscribe();
       metricsSub.unsubscribe();
       sub.unsubscribe();
       disconnectNode(node);

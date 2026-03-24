@@ -4,11 +4,12 @@
  */
 
 import { createLogger, LogLevel, type Log } from "@joyautomation/coral";
-import { loadBridgeConfig } from "./types/config.ts";
-import { setupSparkplugBridge } from "./mqtt.ts";
+import { loadNatsConfig, createMqttConfigManager, buildBridgeConfig } from "./types/config.ts";
+import { setupSparkplugBridge, setBridgeLogger } from "./mqtt.ts";
+import { connect } from "@nats-io/transport-deno";
 import { jetstream } from "@nats-io/jetstream";
 import { Kvm } from "@nats-io/kv";
-import type { ServiceHeartbeat, ServiceLogEntry } from "@joyautomation/nats-schema";
+import type { ServiceHeartbeat, ServiceLogEntry, ServiceEnabledKV } from "@joyautomation/nats-schema";
 import type { NatsConnection } from "@nats-io/transport-deno";
 
 let log: Log = createLogger("mqtt-main", LogLevel.info);
@@ -50,20 +51,43 @@ async function main() {
   try {
     log.info("=== tentacle-mqtt: MQTT Sparkplug B Bridge ===");
 
-    // Load configuration from environment
-    const config = loadBridgeConfig();
+    // Load NATS config from env (needed before KV is available)
+    const natsConfig = loadNatsConfig();
+    log.info(`NATS Servers: ${Array.isArray(natsConfig.servers) ? natsConfig.servers.join(", ") : natsConfig.servers}`);
 
-    log.info("Configuration:");
+    // Connect to NATS first to access KV config
+    const configNc = await connect({
+      servers: natsConfig.servers,
+      user: natsConfig.user,
+      pass: natsConfig.pass,
+      token: natsConfig.token,
+    });
+    log.info("Connected to NATS for config");
+
+    // Load config from NATS KV (falls back to env vars on first boot)
+    const configManager = await createMqttConfigManager(configNc);
+    const config = buildBridgeConfig(configManager, natsConfig);
+
+    log.info("Configuration (from NATS KV):");
     log.info(`  MQTT Broker: ${config.mqtt.brokerUrl}`);
     log.info(`  MQTT Group ID: ${config.mqtt.groupId}`);
     log.info(`  MQTT Edge Node: ${config.mqtt.edgeNode}`);
-    log.info(`  NATS Servers: ${Array.isArray(config.nats.servers) ? config.nats.servers.join(", ") : config.nats.servers}`);
+    log.info(`  Device ID: ${config.deviceId || "(none)"}`);
+    log.info(`  Use Templates: ${config.useTemplates}`);
+    log.info(`  Primary Host: ${config.storeForward.primaryHostId || "(none)"}`);
+
+    // Close the config-only NATS connection (bridge creates its own)
+    await configNc.close();
 
     // Setup the bridge
     const bridge = await setupSparkplugBridge(config);
 
-    // Enable NATS log streaming
+    // Enable NATS log streaming for both main and bridge loggers
     log = createNatsLogger(log, bridge.natsConnection, "mqtt", "mqtt", "mqtt-main");
+    setBridgeLogger(createNatsLogger(
+      createLogger("mqtt-bridge", LogLevel.info),
+      bridge.natsConnection, "mqtt", "mqtt", "mqtt-bridge",
+    ));
 
     // Heartbeat publishing for service discovery
     const js = jetstream(bridge.natsConnection);
@@ -74,6 +98,44 @@ async function main() {
     });
     const heartbeatKey = "mqtt";
     const startedAt = Date.now();
+
+    // ── Service enabled/disabled state ──────────────────────────────────────
+    const enabledKv = await kvm.create("service_enabled", {
+      history: 1,
+      ttl: 0, // No expiration
+    });
+
+    // Check initial enabled state
+    try {
+      const entry = await enabledKv.get(heartbeatKey);
+      if (entry?.value) {
+        const state = JSON.parse(new TextDecoder().decode(entry.value)) as ServiceEnabledKV;
+        bridge.setEnabled(state.enabled);
+        log.info(`Initial enabled state: ${state.enabled}`);
+      }
+    } catch {
+      // Key doesn't exist = enabled by default
+    }
+
+    // Watch for enabled state changes
+    const enabledWatcher = await enabledKv.watch({ key: heartbeatKey });
+    (async () => {
+      for await (const entry of enabledWatcher) {
+        if (entry === null) continue;
+        if (entry.operation === "DEL" || entry.operation === "PURGE") {
+          bridge.setEnabled(true); // deleted = default to enabled
+          continue;
+        }
+        if (entry.value) {
+          try {
+            const state = JSON.parse(new TextDecoder().decode(entry.value)) as ServiceEnabledKV;
+            bridge.setEnabled(state.enabled);
+          } catch {
+            // Invalid data — ignore
+          }
+        }
+      }
+    })();
 
     const publishHeartbeat = async () => {
       const heartbeat: ServiceHeartbeat = {
@@ -92,6 +154,7 @@ async function main() {
           tlsEnabled: String(config.mqtt.tlsEnabled ?? false),
           useTemplates: String(config.useTemplates),
           deviceId: config.deviceId ?? "",
+          enabled: String(bridge.enabled),
         },
       };
       try {
@@ -112,6 +175,11 @@ async function main() {
     const shutdown = async () => {
       log.info("Shutting down...");
       clearInterval(heartbeatInterval);
+      try {
+        enabledWatcher.stop();
+      } catch {
+        // Watcher may already be stopped
+      }
       try {
         await heartbeatsKv.delete(heartbeatKey);
       } catch {
