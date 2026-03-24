@@ -55,7 +55,7 @@ async function main() {
     const natsConfig = loadNatsConfig();
     log.info(`NATS Servers: ${Array.isArray(natsConfig.servers) ? natsConfig.servers.join(", ") : natsConfig.servers}`);
 
-    // Connect to NATS first to access KV config
+    // Connect to NATS for config watching (kept alive for the lifetime of the process)
     const configNc = await connect({
       servers: natsConfig.servers,
       user: natsConfig.user,
@@ -66,142 +66,192 @@ async function main() {
 
     // Load config from NATS KV (falls back to env vars on first boot)
     const configManager = await createMqttConfigManager(configNc);
-    const config = buildBridgeConfig(configManager, natsConfig);
 
-    log.info("Configuration (from NATS KV):");
-    log.info(`  MQTT Broker: ${config.mqtt.brokerUrl}`);
-    log.info(`  MQTT Group ID: ${config.mqtt.groupId}`);
-    log.info(`  MQTT Edge Node: ${config.mqtt.edgeNode}`);
-    log.info(`  Device ID: ${config.deviceId || "(none)"}`);
-    log.info(`  Use Templates: ${config.useTemplates}`);
-    log.info(`  Primary Host: ${config.storeForward.primaryHostId || "(none)"}`);
-
-    // Close the config-only NATS connection (bridge creates its own)
-    await configNc.close();
-
-    // Setup the bridge
-    const bridge = await setupSparkplugBridge(config);
-
-    // Enable NATS log streaming for both main and bridge loggers
-    log = createNatsLogger(log, bridge.natsConnection, "mqtt", "mqtt", "mqtt-main");
-    setBridgeLogger(createNatsLogger(
-      createLogger("mqtt-bridge", LogLevel.info),
-      bridge.natsConnection, "mqtt", "mqtt", "mqtt-bridge",
-    ));
-
-    // Heartbeat publishing for service discovery
-    const js = jetstream(bridge.natsConnection);
-    const kvm = new Kvm(js);
-    const heartbeatsKv = await kvm.create("service_heartbeats", {
-      history: 1,
-      ttl: 60 * 1000,
-    });
     const heartbeatKey = "mqtt";
     const startedAt = Date.now();
 
-    // ── Service enabled/disabled state ──────────────────────────────────────
-    const enabledKv = await kvm.create("service_enabled", {
-      history: 1,
-      ttl: 0, // No expiration
-    });
+    // ── Bridge lifecycle ──────────────────────────────────────────────────
+    let bridge: Awaited<ReturnType<typeof setupSparkplugBridge>> | null = null;
+    let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+    // deno-lint-ignore no-explicit-any
+    let enabledWatcher: any = null;
+    let shutdownSub: ReturnType<NatsConnection["subscribe"]> | null = null;
 
-    // Check initial enabled state
-    try {
-      const entry = await enabledKv.get(heartbeatKey);
-      if (entry?.value) {
-        const state = JSON.parse(new TextDecoder().decode(entry.value)) as ServiceEnabledKV;
-        bridge.setEnabled(state.enabled);
-        log.info(`Initial enabled state: ${state.enabled}`);
-      }
-    } catch {
-      // Key doesn't exist = enabled by default
-    }
+    async function startBridge() {
+      const config = buildBridgeConfig(configManager, natsConfig);
 
-    // Watch for enabled state changes
-    const enabledWatcher = await enabledKv.watch({ key: heartbeatKey });
-    (async () => {
-      for await (const entry of enabledWatcher) {
-        if (entry === null) continue;
-        if (entry.operation === "DEL" || entry.operation === "PURGE") {
-          bridge.setEnabled(true); // deleted = default to enabled
-          continue;
+      log.info("Configuration (from NATS KV):");
+      log.info(`  MQTT Broker: ${config.mqtt.brokerUrl}`);
+      log.info(`  MQTT Group ID: ${config.mqtt.groupId}`);
+      log.info(`  MQTT Edge Node: ${config.mqtt.edgeNode}`);
+      log.info(`  Device ID: ${config.deviceId || "(none)"}`);
+      log.info(`  Use Templates: ${config.useTemplates}`);
+      log.info(`  Primary Host: ${config.storeForward.primaryHostId || "(none)"}`);
+
+      bridge = await setupSparkplugBridge(config);
+
+      // Enable NATS log streaming for both main and bridge loggers
+      log = createNatsLogger(log, bridge.natsConnection, "mqtt", "mqtt", "mqtt-main");
+      setBridgeLogger(createNatsLogger(
+        createLogger("mqtt-bridge", LogLevel.info),
+        bridge.natsConnection, "mqtt", "mqtt", "mqtt-bridge",
+      ));
+
+      // Heartbeat publishing for service discovery
+      const js = jetstream(bridge.natsConnection);
+      const kvm = new Kvm(js);
+      const heartbeatsKv = await kvm.create("service_heartbeats", {
+        history: 1,
+        ttl: 60 * 1000,
+      });
+
+      // ── Service enabled/disabled state ────────────────────────────────
+      const enabledKv = await kvm.create("service_enabled", {
+        history: 1,
+        ttl: 0,
+      });
+
+      // Check initial enabled state
+      try {
+        const entry = await enabledKv.get(heartbeatKey);
+        if (entry?.value) {
+          const state = JSON.parse(new TextDecoder().decode(entry.value)) as ServiceEnabledKV;
+          bridge.setEnabled(state.enabled);
+          log.info(`Initial enabled state: ${state.enabled}`);
         }
-        if (entry.value) {
-          try {
-            const state = JSON.parse(new TextDecoder().decode(entry.value)) as ServiceEnabledKV;
-            bridge.setEnabled(state.enabled);
-          } catch {
-            // Invalid data — ignore
+      } catch {
+        // Key doesn't exist = enabled by default
+      }
+
+      // Watch for enabled state changes
+      enabledWatcher = await enabledKv.watch({ key: heartbeatKey });
+      const currentWatcher = enabledWatcher;
+      (async () => {
+        for await (const entry of currentWatcher) {
+          if (entry === null) continue;
+          if (entry.operation === "DEL" || entry.operation === "PURGE") {
+            bridge?.setEnabled(true);
+            continue;
+          }
+          if (entry.value) {
+            try {
+              const state = JSON.parse(new TextDecoder().decode(entry.value)) as ServiceEnabledKV;
+              bridge?.setEnabled(state.enabled);
+            } catch {
+              // Invalid data — ignore
+            }
           }
         }
-      }
-    })();
+      })();
 
-    const publishHeartbeat = async () => {
-      const heartbeat: ServiceHeartbeat = {
-        serviceType: "mqtt",
-        moduleId: "mqtt",
-        lastSeen: Date.now(),
-        startedAt,
-        metadata: {
-          brokerUrl: config.mqtt.brokerUrl,
-          clientId: config.mqtt.clientId,
-          groupId: config.mqtt.groupId,
-          edgeNode: config.mqtt.edgeNode,
-          username: config.mqtt.username ?? "",
-          password: config.mqtt.password ? "••••••••" : "",
-          keepalive: String(config.mqtt.keepalive ?? 30),
-          tlsEnabled: String(config.mqtt.tlsEnabled ?? false),
-          useTemplates: String(config.useTemplates),
-          deviceId: config.deviceId ?? "",
-          enabled: String(bridge.enabled),
-        },
+      const publishHeartbeat = async () => {
+        const heartbeat: ServiceHeartbeat = {
+          serviceType: "mqtt",
+          moduleId: "mqtt",
+          lastSeen: Date.now(),
+          startedAt,
+          metadata: {
+            brokerUrl: config.mqtt.brokerUrl,
+            clientId: config.mqtt.clientId,
+            groupId: config.mqtt.groupId,
+            edgeNode: config.mqtt.edgeNode,
+            username: config.mqtt.username ?? "",
+            password: config.mqtt.password ? "••••••••" : "",
+            keepalive: String(config.mqtt.keepalive ?? 30),
+            tlsEnabled: String(config.mqtt.tlsEnabled ?? false),
+            useTemplates: String(config.useTemplates),
+            deviceId: config.deviceId ?? "",
+            enabled: String(bridge?.enabled ?? true),
+          },
+        };
+        try {
+          const encoder = new TextEncoder();
+          await heartbeatsKv.put(heartbeatKey, encoder.encode(JSON.stringify(heartbeat)));
+        } catch (err) {
+          log.warn(`Failed to publish heartbeat: ${err}`);
+        }
       };
-      try {
-        const encoder = new TextEncoder();
-        await heartbeatsKv.put(heartbeatKey, encoder.encode(JSON.stringify(heartbeat)));
-      } catch (err) {
-        log.warn(`Failed to publish heartbeat: ${err}`);
+
+      await publishHeartbeat();
+      log.info("Service heartbeat started (moduleId: mqtt)");
+      heartbeatInterval = setInterval(publishHeartbeat, 10000);
+
+      // Listen for NATS shutdown command from graphql
+      shutdownSub = bridge.natsConnection.subscribe("mqtt.shutdown");
+      const currentShutdownSub = shutdownSub;
+      (async () => {
+        for await (const _msg of currentShutdownSub) {
+          log.info("Received shutdown command via NATS");
+          await shutdown();
+          break;
+        }
+      })();
+
+      log.info("Bridge running.");
+    }
+
+    async function stopBridge() {
+      if (heartbeatInterval) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
       }
-    };
+      if (enabledWatcher) {
+        try { enabledWatcher.stop(); } catch { /* already stopped */ }
+        enabledWatcher = null;
+      }
+      if (shutdownSub) {
+        shutdownSub.unsubscribe();
+        shutdownSub = null;
+      }
+      if (bridge) {
+        await bridge.disconnect();
+        bridge = null;
+      }
+    }
 
-    await publishHeartbeat();
-    log.info("Service heartbeat started (moduleId: mqtt)");
-    const heartbeatInterval = setInterval(publishHeartbeat, 10000);
+    // ── Shutdown (defined before startBridge so it can be referenced) ────
+    let restartTimer: ReturnType<typeof setTimeout> | null = null;
+    let restarting = false;
 
-    log.info("Bridge running. Press Ctrl+C to stop.");
-
-    // Handle graceful shutdown
     const shutdown = async () => {
       log.info("Shutting down...");
-      clearInterval(heartbeatInterval);
-      try {
-        enabledWatcher.stop();
-      } catch {
-        // Watcher may already be stopped
-      }
-      try {
-        await heartbeatsKv.delete(heartbeatKey);
-      } catch {
-        // May already be expired
-      }
-      await bridge.disconnect();
+      if (restartTimer) clearTimeout(restartTimer);
+      configManager.destroy();
+      await stopBridge();
+      await configNc.close();
       log.info("Goodbye!");
       Deno.exit(0);
     };
 
+    // ── Config change watcher (debounced restart) ─────────────────────────
+    configManager.onChange((key, value) => {
+      log.info(`Config changed: ${key} = ${key === "password" ? "••••••••" : value}`);
+      if (restarting) return;
+      // Debounce — "Save All" fires one mutation per field
+      if (restartTimer) clearTimeout(restartTimer);
+      restartTimer = setTimeout(async () => {
+        restartTimer = null;
+        restarting = true;
+        try {
+          log.info("Restarting bridge with updated config...");
+          await stopBridge();
+          await startBridge();
+          log.info("Bridge restarted successfully.");
+        } catch (err) {
+          log.error("Failed to restart bridge:", err);
+        } finally {
+          restarting = false;
+        }
+      }, 2000);
+    });
+
+    // ── Initial start ─────────────────────────────────────────────────────
+    await startBridge();
+
     Deno.addSignalListener("SIGINT", shutdown);
     Deno.addSignalListener("SIGTERM", shutdown);
 
-    // Listen for NATS shutdown command from graphql
-    const shutdownSub = bridge.natsConnection.subscribe("mqtt.shutdown");
-    (async () => {
-      for await (const _msg of shutdownSub) {
-        log.info("Received shutdown command via NATS");
-        await shutdown();
-        break;
-      }
-    })();
+    log.info("Press Ctrl+C to stop.");
   } catch (error) {
     log.error("Fatal error:", error);
     Deno.exit(1);
