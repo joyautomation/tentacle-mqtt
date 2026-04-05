@@ -1,6 +1,7 @@
 {
   "tasks": {
-    "dev": "deno run --env-file=.env --watch --allow-all main.ts"
+    "dev": "deno run --env-file=.env --watch --allow-all main.ts",
+    "test": "deno test --no-check --allow-all"
   },
   "imports": {
     "@joyautomation/coral": "jsr:@joyautomation/coral@^0.0.12",

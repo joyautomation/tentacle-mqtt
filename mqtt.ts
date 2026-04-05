@@ -56,12 +56,12 @@ type PlcVariable = {
 // We track publish state ourselves so the units stay consistent.
 // =============================================================================
 
-type RBEState = {
+export type RBEState = {
   lastPublishedValue: number | boolean | string | Record<string, unknown>;
   lastPublishedTime: number; // Date.now() ms
 };
 
-const rbeState = new Map<string, RBEState>();
+export const rbeState = new Map<string, RBEState>();
 
 // =============================================================================
 // Template Definition Registry
@@ -70,7 +70,7 @@ const rbeState = new Map<string, RBEState>();
 // =============================================================================
 const knownTemplates = new Map<string, UdtTemplateDefinition>();
 
-function shouldPublish(
+export function shouldPublish(
   variableId: string,
   value: unknown,
   deadband?: { value: number; minTime?: number; maxTime?: number },
@@ -105,7 +105,7 @@ function shouldPublish(
   return value !== state.lastPublishedValue;
 }
 
-function recordPublish(variableId: string, value: unknown, variables?: Map<string, PlcVariable>): void {
+export function recordPublish(variableId: string, value: unknown, variables?: Map<string, PlcVariable>): void {
   const now = Date.now();
   rbeState.set(variableId, {
     lastPublishedValue: value as number | boolean | string | Record<string, unknown>,
@@ -128,7 +128,7 @@ function recordPublish(variableId: string, value: unknown, variables?: Map<strin
  * exceeds its deadband, or if any non-numeric member changed.
  * UDT-level minTime/maxTime from the variable deadband still applies.
  */
-function shouldPublishUdt(
+export function shouldPublishUdt(
   variableId: string,
   udtValue: Record<string, unknown>,
   memberDeadbands: Record<string, { value: number; minTime?: number; maxTime?: number }>,
@@ -191,7 +191,7 @@ function shouldPublishUdt(
 // 3.0:     {"online":true,"timestamp":1775147386540} (JSON object)
 // =============================================================================
 
-function parseStatePayload(payload: string): boolean {
+export function parseStatePayload(payload: string): boolean {
   try {
     const parsed = JSON.parse(payload);
     if (typeof parsed === "object" && parsed !== null && "online" in parsed) {
