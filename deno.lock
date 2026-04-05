@@ -3,7 +3,7 @@
   "specifiers": {
     "jsr:@joyautomation/coral@^0.0.12": "0.0.12",
     "jsr:@joyautomation/dark-matter@^0.0.26": "0.0.26",
-    "jsr:@joyautomation/synapse@^0.0.99": "0.0.99",
+    "jsr:@joyautomation/synapse@^0.0.100": "0.0.100",
     "jsr:@joyautomation/tentacle-nats-schema@^0.0.8": "0.0.8",
     "jsr:@nats-io/jetstream@3.3": "3.3.1",
     "jsr:@nats-io/jetstream@3.3.1": "3.3.1",
@@ -34,8 +34,8 @@
     "@joyautomation/dark-matter@0.0.26": {
       "integrity": "7276ddefea2448937b72ada91b3adb86efe4f01032c1dd7915900b59201cba2e"
     },
-    "@joyautomation/synapse@0.0.99": {
-      "integrity": "aa08235ee52b9f1926bf660a66849036669d35ebf069a47f5d2f9348eca09122",
+    "@joyautomation/synapse@0.0.100": {
+      "integrity": "3bf9b77d7a61554f1b3f4c25ff87c0a6a3f1da80a76bf83b201b6cfca40a6f01",
       "dependencies": [
         "jsr:@joyautomation/coral",
         "jsr:@joyautomation/dark-matter",
@@ -429,15 +429,15 @@
         "worker-timers-worker"
       ]
     },
-    "ws@8.20.0": {
-      "integrity": "sha512-sAt8BhgNbzCtgGbt2OxmpuryO63ZoDk/sqaB/znQm94T4fCEsy/yV+7CdC1kJhOU9lboAEU7R3kquuycDoibVA=="
+    "ws@8.19.0": {
+      "integrity": "sha512-blAT2mjOEIi0ZzruJfIhb3nps74PRWTCz1IjglWEEpQl5XS/UNama6u2/rjFkDDouqr4L67ry+1aGIALViWjDg=="
     }
   },
   "workspace": {
     "dependencies": [
       "jsr:@joyautomation/coral@^0.0.12",
       "jsr:@joyautomation/dark-matter@^0.0.27",
-      "jsr:@joyautomation/synapse@^0.0.99",
+      "jsr:@joyautomation/synapse@^0.0.100",
       "jsr:@joyautomation/tentacle-nats-schema@^0.0.8",
       "jsr:@nats-io/jetstream@3.3",
       "jsr:@nats-io/kv@3",

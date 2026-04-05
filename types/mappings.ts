@@ -195,13 +195,29 @@ function memberToSparkplugType(datatype: "number" | "boolean" | "string"): strin
 }
 
 /**
+ * Return the zero/default value for a member datatype.
+ * Used for template definitions so Ignition can properly create typed members.
+ * (Some Sparkplug B hosts fail to infer the type from datatype alone when isNull=true.)
+ */
+function defaultMemberValue(datatype: "number" | "boolean" | "string"): number | boolean | string {
+  switch (datatype) {
+    case "number": return 0;
+    case "boolean": return false;
+    case "string": return "";
+  }
+}
+
+/**
  * Convert a raw member value to the appropriate JS primitive.
  */
 function convertMemberValue(
   value: unknown,
   datatype: "number" | "boolean" | "string",
 ): number | boolean | string | null {
-  if (value === null || value === undefined) return null;
+  if (value === null || value === undefined) {
+    if (datatype === "boolean") return false;
+    return null;
+  }
   switch (datatype) {
     case "number":
       return typeof value === "number" ? value : parseFloat(String(value));
@@ -227,7 +243,9 @@ function buildTemplateMetrics(
   value: Record<string, unknown> | null,
   isDefinition: boolean,
   allTemplates?: ReadonlyMap<string, UdtTemplateDefinition>,
+  timestamp?: number,
 ): any[] {
+  const ts = isDefinition ? undefined : (timestamp ?? Date.now());
   return members.map((m) => {
     // Nested template member?
     if (m.templateRef && allTemplates) {
@@ -241,15 +259,18 @@ function buildTemplateMetrics(
           type: "template" as never,
           value: {
             isDefinition,
-            templateRef: isDefinition ? "" : nestedTemplate.name,
-            version: isDefinition ? (nestedTemplate.version ?? "1.0") : "",
+            // templateRef MUST be omitted for definitions, required for instances
+            ...(isDefinition ? {} : { templateRef: nestedTemplate.name }),
+            ...(isDefinition ? { version: nestedTemplate.version ?? "1.0" } : {}),
             metrics: buildTemplateMetrics(
               nestedTemplate.members,
               nestedValue,
               isDefinition,
               allTemplates,
+              timestamp,
             ),
           },
+          timestamp: ts,
         };
       }
     }
@@ -257,7 +278,8 @@ function buildTemplateMetrics(
     return {
       name: m.name,
       type: memberToSparkplugType(m.datatype) as never,
-      value: isDefinition ? null : convertMemberValue(value?.[m.name], m.datatype),
+      value: isDefinition ? defaultMemberValue(m.datatype) : convertMemberValue(value?.[m.name], m.datatype),
+      timestamp: ts,
     };
   });
 }
@@ -269,8 +291,8 @@ function buildTemplateMetrics(
  * The returned metric has:
  *   type: "template"
  *   value.isDefinition: true
- *   value.templateRef: ""
- *   value.metrics: member stubs with null values (nested templates recurse)
+ *   value.version: template version
+ *   value.metrics: member stubs with default values (nested templates recurse)
  *
  * @param template - The UDT template definition
  * @param allTemplates - Registry of all known templates (for resolving nested templateRef)
@@ -284,7 +306,7 @@ export function createTemplateDefinitionMetric(
     type: "template" as never,
     value: {
       isDefinition: true,
-      templateRef: "",
+      // templateRef MUST be omitted for definitions (Sparkplug B spec)
       version: template.version ?? "1.0",
       metrics: buildTemplateMetrics(template.members, null, true, allTemplates),
     } as any,
@@ -321,8 +343,8 @@ export function createTemplateInstanceMetric(
     value: {
       isDefinition: false,
       templateRef: template.name,
-      version: "",
-      metrics: buildTemplateMetrics(template.members, value, false, allTemplates),
+      // version omitted for instances (only definitions carry version)
+      metrics: buildTemplateMetrics(template.members, value, false, allTemplates, timestamp),
     } as any,
     timestamp,
   };

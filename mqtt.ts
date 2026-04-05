@@ -5,7 +5,7 @@
  */
 
 import { connect, type NatsConnection } from "@nats-io/transport-deno";
-import { disconnectNode, setValue, addMetrics, publishDeviceBirth, publishDeviceData } from "@joyautomation/synapse";
+import { disconnectNode, setValue, addMetrics, publishDeviceBirth, publishDeviceData, publishNodeBirth } from "@joyautomation/synapse";
 import type {
   SparkplugCreateNodeInput,
   SparkplugNode,
@@ -38,6 +38,8 @@ type PlcVariable = {
   publishedValue?: number | boolean | string | Record<string, unknown>;
   deadband?: { value: number; minTime?: number; maxTime?: number };
   disableRBE?: boolean;
+  /** Per-member RBE deadband config for UDT variables, keyed by member name */
+  memberDeadbands?: Record<string, { value: number; minTime?: number; maxTime?: number }>;
   /** The moduleId of the source module that published this variable */
   moduleId: string;
   /** Sparkplug B UDT template definition (only for datatype "udt") */
@@ -119,25 +121,139 @@ function recordPublish(variableId: string, value: unknown, variables?: Map<strin
   }
 }
 
+/**
+ * Per-member RBE check for UDT template instances.
+ * Instead of comparing the entire JSON-stringified UDT, checks each member
+ * against its own deadband threshold. Publishes if ANY member's change
+ * exceeds its deadband, or if any non-numeric member changed.
+ * UDT-level minTime/maxTime from the variable deadband still applies.
+ */
+function shouldPublishUdt(
+  variableId: string,
+  udtValue: Record<string, unknown>,
+  memberDeadbands: Record<string, { value: number; minTime?: number; maxTime?: number }>,
+  variableDeadband?: { value: number; minTime?: number; maxTime?: number },
+): boolean {
+  const state = rbeState.get(variableId);
+  if (!state) return true; // never published — always publish
+
+  const now = Date.now();
+  const elapsed = now - state.lastPublishedTime;
+
+  // UDT-level maxTime: force publish if exceeded
+  if (variableDeadband?.maxTime && elapsed >= variableDeadband.maxTime) return true;
+
+  // UDT-level minTime: suppress if not elapsed
+  if (variableDeadband?.minTime && elapsed < variableDeadband.minTime) return false;
+
+  // Parse previously published value
+  let prevValue: Record<string, unknown>;
+  try {
+    prevValue = typeof state.lastPublishedValue === "string"
+      ? JSON.parse(state.lastPublishedValue)
+      : state.lastPublishedValue as Record<string, unknown>;
+  } catch {
+    return true; // can't parse previous — publish
+  }
+
+  // Check each member against its deadband
+  for (const [memberName, newVal] of Object.entries(udtValue)) {
+    const prevVal = prevValue[memberName];
+    const db = memberDeadbands[memberName];
+
+    if (db && typeof newVal === "number" && typeof prevVal === "number") {
+      // Numeric member with deadband: check threshold
+      if (Math.abs(newVal - prevVal) > db.value) return true;
+    } else {
+      // Non-numeric or no deadband: publish on any change
+      if (newVal !== prevVal) {
+        // Deep compare for nested objects
+        if (typeof newVal === "object" || typeof prevVal === "object") {
+          if (JSON.stringify(newVal) !== JSON.stringify(prevVal)) return true;
+        } else {
+          return true;
+        }
+      }
+    }
+  }
+
+  // Check for removed members
+  for (const memberName of Object.keys(prevValue)) {
+    if (!(memberName in udtValue)) return true;
+  }
+
+  return false; // no member changed enough
+}
+
+// =============================================================================
+// STATE payload parsing — supports both legacy and Sparkplug B 3.0 formats
+// Legacy:  "ONLINE" or "OFFLINE" (plain string)
+// 3.0:     {"online":true,"timestamp":1775147386540} (JSON object)
+// =============================================================================
+
+function parseStatePayload(payload: string): boolean {
+  try {
+    const parsed = JSON.parse(payload);
+    if (typeof parsed === "object" && parsed !== null && "online" in parsed) {
+      return Boolean(parsed.online);
+    }
+  } catch {
+    // Not JSON — fall through to legacy format
+  }
+  return payload.toUpperCase() === "ONLINE";
+}
+
 // =============================================================================
 // Rebirth batching — collect new metrics and send ONE DBIRTH after a quiet period
+// When new template definitions are registered, NBIRTH is sent first so Ignition
+// (and other Sparkplug B hosts) learn the definitions before seeing instances.
 // =============================================================================
 
 const REBIRTH_DEBOUNCE_MS = 500;
 let rebirthTimer: ReturnType<typeof setTimeout> | null = null;
 let rebirthPending = false;
+let rebirthIncludesNode = false;
 
 function scheduleRebirth(
   node: SparkplugNode,
   deviceId: string,
   config: BridgeConfig,
+  includeNodeBirth = false,
 ): void {
   rebirthPending = true;
+  if (includeNodeBirth) rebirthIncludesNode = true;
   if (rebirthTimer) clearTimeout(rebirthTimer);
   rebirthTimer = setTimeout(() => {
     rebirthTimer = null;
     rebirthPending = false;
+    const doNodeBirth = rebirthIncludesNode;
+    rebirthIncludesNode = false;
     if (!node.mqtt) return;
+
+    // If new template definitions were added, publish NBIRTH first so hosts
+    // (Ignition) learn the definitions before seeing instances in DBIRTH/DDATA.
+    if (doNodeBirth) {
+      const nodeMetrics = Object.values(node.metrics).map(m => ({
+        ...m,
+        value: typeof m.value === "function" ? m.value() : m.value,
+        timestamp: Date.now(),
+      }));
+      const nbirthPayload = {
+        timestamp: Date.now(),
+        metrics: [
+          {
+            name: "Node Control/Rebirth",
+            value: false,
+            type: "boolean" as never,
+            timestamp: Date.now(),
+          },
+          ...nodeMetrics,
+        ],
+      } as any;
+      publishNodeBirth(node, undefined, nbirthPayload);
+      log.info(`Published NBIRTH with ${nodeMetrics.length} node metrics (template definitions)`);
+    }
+
     const device = node.devices[deviceId];
     if (!device) return;
     const mqttConfig = {
@@ -154,7 +270,7 @@ function scheduleRebirth(
       })),
     } as any;
     publishDeviceBirth(node, birthPayload, mqttConfig, node.mqtt, deviceId);
-    log.info(`Published batched DBIRTH for device ${deviceId} with ${Object.keys(device.metrics).length} metrics`);
+    log.info(`Published ${doNodeBirth ? "NBIRTH + " : ""}DBIRTH for device ${deviceId} with ${Object.keys(device.metrics).length} metrics`);
   }, REBIRTH_DEBOUNCE_MS);
 }
 
@@ -405,7 +521,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
     // Store & Forward: listen for STATE messages from primary host
     if (config.storeForward.primaryHostId) {
       node.events.on("state" as any, (state: string, hostId: string) => {
-        const online = state.toUpperCase() === "ONLINE";
+        const online = parseStatePayload(state);
         sfBuffer.handleStateChange(hostId, online);
       });
 
@@ -458,11 +574,29 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
         } as any;
       };
 
+      // Subscribe to spBv1.0/STATE/# for Sparkplug B 3.0 JSON STATE messages
+      // Synapse <= 0.0.99 only subscribes to STATE/# (legacy format).
+      // This can be removed once synapse is updated and published with spBv1.0/STATE/# support.
+      const subscribeSpb3State = () => {
+        if (!node.mqtt) return;
+        node.mqtt.subscribe("spBv1.0/STATE/#", { qos: 1 });
+        node.mqtt.on("message", (topic: string, message: Buffer) => {
+          if (!topic.startsWith("spBv1.0/STATE/")) return;
+          const hostId = topic.slice("spBv1.0/STATE/".length);
+          if (!hostId) return;
+          const payload = typeof message === "string" ? message : new TextDecoder().decode(message);
+          const online = parseStatePayload(payload);
+          log.info(`spBv1.0 STATE message for ${hostId}: ${online ? "ONLINE" : "OFFLINE"}`);
+          sfBuffer.handleStateChange(hostId, online);
+        });
+      };
+
       // Wrap on initial connect and on reconnects
       node.events.on("connected" as any, () => {
         wrapMqttPublish();
+        subscribeSpb3State();
       });
-      if (node.mqtt) wrapMqttPublish();
+      if (node.mqtt) { wrapMqttPublish(); subscribeSpb3State(); }
     }
   }
 
@@ -584,6 +718,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
           disableRBE?: boolean;
           description?: string;
           udtTemplate?: UdtTemplateDefinition;
+          memberDeadbands?: Record<string, { value: number; minTime?: number; maxTime?: number }>;
         };
 
         const { variableId, value } = data;
@@ -610,6 +745,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
           tracked.lastUpdated = Date.now();
           if (disableRBE !== undefined) tracked.disableRBE = disableRBE;
           if (data.udtTemplate) tracked.udtTemplate = data.udtTemplate;
+          if (data.memberDeadbands) tracked.memberDeadbands = data.memberDeadbands;
           // Update datatype if it was corrected (e.g., from template parsing fix)
           if (tracked.datatype !== datatype) {
             log.debug(`Updating stored datatype for ${variableId}: ${tracked.datatype} -> ${datatype}`);
@@ -625,6 +761,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
             disableRBE,
             moduleId: sourceModuleId,
             udtTemplate: data.udtTemplate,
+            memberDeadbands: data.memberDeadbands,
             lastUpdated: Date.now(),
           };
           variables.set(variableId, tracked);
@@ -636,13 +773,16 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
           const udtValue = value as Record<string, unknown>;
 
           if (config.useTemplates) {
-            // Register template definition (and any nested templates via templateRef)
+            // Register template definition as a node-level metric (NBIRTH only).
+            // Per Sparkplug B spec, template definitions MUST be in NBIRTH.
+            let newDefinitionRegistered = false;
             const registerTemplate = (tmpl: UdtTemplateDefinition) => {
               if (knownTemplates.has(tmpl.name)) return;
               knownTemplates.set(tmpl.name, tmpl);
               const defMetric = createTemplateDefinitionMetric(tmpl, knownTemplates);
-              addMetrics(node, { [tmpl.name]: defMetric }, deviceId);
-              log.info(`Registered Sparkplug B template definition: ${tmpl.name}`);
+              addMetrics(node, { [tmpl.name]: defMetric });
+              newDefinitionRegistered = true;
+              log.info(`Registered Sparkplug B template definition: ${tmpl.name} (node-level for NBIRTH)`);
             };
             // Register nested templates first (depth-first) so definitions precede instances
             for (const member of udtTemplate.members) {
@@ -674,10 +814,13 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
               log.info(`New template instance: ${variableId} (${udtTemplate.name})`);
               addMetrics(node, { [variableId]: instanceMetric }, deviceId);
               recordPublish(variableId, JSON.stringify(udtValue), variables);
-              scheduleRebirth(node, deviceId, config);
+              scheduleRebirth(node, deviceId, config, newDefinitionRegistered);
             } else {
-              // Publish only when content changes (compare JSON strings for equality)
-              if (shouldPublish(variableId, JSON.stringify(udtValue), tracked?.deadband)) {
+              // Per-member RBE: check each member against its own deadband threshold
+              const publish = tracked?.memberDeadbands && Object.keys(tracked.memberDeadbands).length > 0
+                ? shouldPublishUdt(variableId, udtValue, tracked.memberDeadbands, tracked?.deadband)
+                : shouldPublish(variableId, JSON.stringify(udtValue), tracked?.deadband);
+              if (publish) {
                 recordPublish(variableId, JSON.stringify(udtValue), variables);
                 // Update stored metric value so future DBIRTH (rebirth) uses current data
                 if (node.devices[deviceId]?.metrics[variableId]) {
@@ -700,11 +843,16 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
                 log.info(`New flat metric (from UDT): ${flatName}`);
                 addMetrics(node, { [flatName]: flatMetric }, deviceId);
                 recordPublish(flatName, flatMetric.value, variables);
-              } else if (shouldPublish(flatName, flatMetric.value, tracked?.deadband)) {
-                recordPublish(flatName, flatMetric.value, variables);
-                if (node.mqtt && !rebirthPending) {
-                  const mqttConfig = { version: node.version || "spBv1.0", groupId: node.groupId, edgeNode: node.id } as any;
-                  publishDeviceData(node, { timestamp: Date.now(), metrics: [{ ...flatMetric, timestamp: Date.now() }] } as any, mqttConfig, node.mqtt, deviceId);
+              } else {
+                // Resolve per-member deadband: extract member name from flat metric name (variableId/memberName)
+                const memberName = flatName.includes("/") ? flatName.substring(flatName.indexOf("/") + 1) : flatName;
+                const memberDb = tracked?.memberDeadbands?.[memberName] ?? tracked?.deadband;
+                if (shouldPublish(flatName, flatMetric.value, memberDb)) {
+                  recordPublish(flatName, flatMetric.value, variables);
+                  if (node.mqtt && !rebirthPending) {
+                    const mqttConfig = { version: node.version || "spBv1.0", groupId: node.groupId, edgeNode: node.id } as any;
+                    publishDeviceData(node, { timestamp: Date.now(), metrics: [{ ...flatMetric, timestamp: Date.now() }] } as any, mqttConfig, node.mqtt, deviceId);
+                  }
                 }
               }
               if (isNewFlat) scheduleRebirth(node, deviceId, config);
@@ -817,7 +965,7 @@ export async function setupSparkplugBridge(config: BridgeConfig) {
           const entry = await heartbeatsKv.get(key);
           if (entry?.value) {
             const hb = JSON.parse(decoder.decode(entry.value));
-            if (hb.serviceType === "plc") {
+            if (hb.serviceType === "plc" || hb.serviceType === "gateway") {
               plcModules.push(hb.moduleId);
             }
           }
